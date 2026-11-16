@@ -30,7 +30,8 @@ public abstract class ClientChunkCacheMixin {
     private void horizon$chunk(int x, int z, ChunkStatus status, boolean load, CallbackInfoReturnable<LevelChunk> cir) {
         if (level == null || !HorizonServer.isMirror(level)) return;
         if (HorizonServer.serverSide(level) instanceof ServerLevel server) {
-            cir.setReturnValue(HorizonChunks.chunk(server, x, z, level));
+            var chunk = HorizonChunks.chunk(server, x, z, level);
+            if (chunk != null || !load) cir.setReturnValue(chunk);
         }
     }
 }

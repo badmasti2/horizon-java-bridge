@@ -11,7 +11,9 @@
 //! `Natives.broadcast`), queued here and taken by the game with [`take_actions`] after the
 //! call, on the server thread, where it applies them as server mods' output.
 
-use jni::objects::{GlobalRef, JClass, JObject, JString, JValue};
+use jni::objects::{
+    GlobalRef, JByteArray, JClass, JIntArray, JObject, JObjectArray, JString, JValue,
+};
 use jni::{JNIEnv, sys};
 use std::sync::{Mutex, OnceLock};
 
@@ -29,13 +31,16 @@ pub struct Player {
     /// Vanilla's game mode ids: 0 survival, 1 creative, 2 adventure, 3 spectator.
     pub game_mode: i32,
     pub health: f32,
-    /// `FoodData`'s food level and saturation.
+    /// `FoodData`'s food level, saturation and exhaustion.
     pub food: i32,
     pub saturation: f32,
+    pub exhaustion: f32,
     /// Vanilla's permission level, 0 (everyone) to 4 (owner): what the player's commands may do.
     pub permission: u8,
     /// The sneak key is held (`Player.isShiftKeyDown`: a mod's sneak-click, a wrench's mode).
     pub sneaking: bool,
+    /// The selected hotbar slot (0–8), even when the inventory contents have not changed.
+    pub selected: u8,
     /// The movement keys held (vanilla's PlayerInput flags: forward 1, backward 2, left 4,
     /// right 8, jump 16, shift 32, sprint 64): a mod's mob it rides steers by them.
     pub input: u8,
@@ -48,6 +53,14 @@ pub struct Player {
 
 /// The slots of a player's inventory the mods see (vanilla's `Inventory`).
 pub const INVENTORY_SLOTS: usize = 41;
+
+/// Pack per-player state for the JVM mirror's tick interface.
+pub fn player_flags(permission: u8, sneaking: bool, selected: u8, input: u8) -> i32 {
+    i32::from(permission)
+        | (i32::from(sneaking) << 8)
+        | (i32::from(selected) << 9)
+        | (i32::from(input & 0x7f) << 16)
+}
 
 /// Something a player did since the last tick.
 #[derive(Clone, Debug, PartialEq)]
@@ -386,17 +399,11 @@ fn call_tick(
     let health: Vec<f32> = players.iter().map(|p| p.health).collect();
     let food: Vec<f32> = players
         .iter()
-        .flat_map(|p| [p.food as f32, p.saturation])
+        .flat_map(|p| [p.food as f32, p.saturation, p.exhaustion])
         .collect();
-    // Per player: the permission level in the low 8 bits, bit 8 the sneak key, bits 16-22
-    // the movement keys (HorizonServer.tick's `permissions`).
     let permissions: Vec<i32> = players
         .iter()
-        .map(|p| {
-            i32::from(p.permission)
-                | (i32::from(p.sneaking) << 8)
-                | (i32::from(p.input & 0x7f) << 16)
-        })
+        .map(|p| player_flags(p.permission, p.sneaking, p.selected, p.input))
         .collect();
     // INVENTORY_SLOTS per player; nulls for a player whose inventory didn't change.
     let mut inventories: Vec<Option<&str>> = Vec::with_capacity(players.len() * INVENTORY_SLOTS);
@@ -500,6 +507,21 @@ fn with_server<T>(
         f(env, class)
     });
     result.map(Some).map_err(|e| crate::describe(&mut env, e))
+}
+
+/// Draw one local player's mod HUD between simulation ticks.
+pub fn client_hud_frame(uuid: &str, [yaw, pitch]: [f32; 2]) -> Result<(), String> {
+    with_server(|env, class| {
+        let uuid = env.new_string(uuid)?;
+        env.call_static_method(
+            class,
+            "clientHudFrame",
+            "(Ljava/lang/String;FF)V",
+            &[JValue::Object(&uuid), JValue::Float(yaw), JValue::Float(pitch)],
+        )?;
+        Ok(())
+    })?;
+    Ok(())
 }
 
 fn string_array(env: &mut JNIEnv, array: JObject) -> jni::errors::Result<Vec<String>> {
@@ -1734,6 +1756,58 @@ pub fn screen_input(uuid: &str, input: &str) -> Result<(), String> {
             &[JValue::Object(&uuid), JValue::Object(&input)],
         )?;
         Ok(())
+    })
+    .map_err(|e| crate::describe(&mut env, e))
+}
+
+pub struct UiImage {
+    pub name: String,
+    pub size: [u32; 2],
+    pub rgba: Vec<u8>,
+}
+
+/// The local player's Java title or pause menu. Pixel buffers travel separately from the JSON.
+pub fn title_ui(input: &str) -> Result<(String, Vec<UiImage>), String> {
+    if !ready() {
+        return Ok(("{}".into(), Vec::new()));
+    }
+    let bridge = crate::get().ok_or("Java isn't running")?;
+    let mut env = bridge
+        .vm()
+        .attach_current_thread_permanently()
+        .map_err(|e| e.to_string())?;
+    env.with_local_frame(16, |env| {
+        let class = bridge.find_class(env, "dev/horizonlab/platform/HorizonTitle")?;
+        let input = env.new_string(input)?;
+        let result = env
+            .call_static_method(
+                class,
+                "exchange",
+                "(Ljava/lang/String;)[Ljava/lang/Object;",
+                &[JValue::Object(&input)],
+            )?
+            .l()?;
+        let result = JObjectArray::from(result);
+        let operations = JString::from(env.get_object_array_element(&result, 0)?);
+        let images = JObjectArray::from(env.get_object_array_element(&result, 1)?);
+        let mut decoded = Vec::new();
+        for i in 0..env.get_array_length(&images)? {
+            let image = env.with_local_frame(8, |env| -> jni::errors::Result<UiImage> {
+                let entry = JObjectArray::from(env.get_object_array_element(&images, i)?);
+                let name = JString::from(env.get_object_array_element(&entry, 0)?);
+                let size = JIntArray::from(env.get_object_array_element(&entry, 1)?);
+                let rgba = JByteArray::from(env.get_object_array_element(&entry, 2)?);
+                let mut dimensions = [0; 2];
+                env.get_int_array_region(&size, 0, &mut dimensions)?;
+                Ok(UiImage {
+                    name: env.get_string(&name)?.into(),
+                    size: dimensions.map(|n| n.max(0) as u32),
+                    rgba: env.convert_byte_array(&rgba)?,
+                })
+            })?;
+            decoded.push(image);
+        }
+        Ok((env.get_string(&operations)?.into(), decoded))
     })
     .map_err(|e| crate::describe(&mut env, e))
 }

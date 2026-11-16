@@ -369,7 +369,9 @@ pub fn install(dir: &Path, world: &Path, selected: &[String]) -> Result<(), Stri
     std::fs::create_dir_all(&target).map_err(|e| err(&target, e))?;
     let mut disabled = Vec::new();
     for pack in crate::packs::folder(dir, horizon_core::version::DATA_PACK_FORMAT) {
-        let (crate::packs::Source::Dir(from) | crate::packs::Source::Zip(from)) = &pack.source;
+        let (crate::packs::Source::Dir(from) | crate::packs::Source::Zip(from)) = &pack.source else {
+            continue;
+        };
         copy(from, &target.join(pack.id.trim_start_matches("file/")))?;
         if !selected.contains(&pack.id) {
             disabled.push(pack.id);

@@ -231,7 +231,7 @@ struct Buffer {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Uniform {
     Sampler,
-    Buffer,
+    Buffer(u64),
     TexelBuffer,
 }
 
@@ -282,6 +282,15 @@ struct Pass {
     cmds: Vec<Cmd>,
 }
 
+struct UiReadback {
+    buffer: wgpu::Buffer,
+    ready: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+    frame: u64,
+    row: u32,
+    padded: u32,
+    height: u32,
+}
+
 struct Gpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -289,8 +298,79 @@ struct Gpu {
     objects: HashMap<i64, Object>,
     next: i64,
     pass: Option<Pass>,
+    /// Recorded commands still refer to resources closed before the pass is submitted.
+    retired: Vec<i64>,
+    ui_readbacks: HashMap<(i64, u32), UiReadback>,
+    frames: u64,
     /// Problems logged once each.
     logged: HashSet<String>,
+}
+
+#[cfg(test)]
+mod resource_lifetime_tests {
+    use super::*;
+
+    #[test]
+    fn frame_boundary_releases_abandoned_pass_resources() {
+        let Ok(mut gpu) = Gpu::open() else { return };
+        let scope = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let baseline = gpu.objects.len();
+        for _ in 0..120 {
+            let id = gpu.create_buffer(16);
+            gpu.write_buffer(id, 0, &[1; 16]);
+            gpu.pass = Some(Pass {
+                colors: Vec::new(),
+                depth: None,
+                area: [0, 0, 1, 1],
+                cmds: vec![Cmd::Vertex(0, id, 0, 16)],
+            });
+            gpu.release(id);
+            gpu.finish_frame();
+            assert_eq!(gpu.objects.len(), baseline);
+            assert!(gpu.retired.is_empty());
+        }
+        assert!(pollster::block_on(scope.pop()).is_none());
+    }
+
+    #[test]
+    fn uniform_padding_preserves_data_and_does_not_read_the_next_allocation() {
+        let Ok(mut gpu) = Gpu::open() else { return };
+        let source = gpu.create_buffer(320);
+        gpu.write_buffer(source, 16, &[7; 160]);
+        gpu.write_buffer(source, 176, &[99; 16]);
+        let padded = gpu.padded_uniform(source, 16, 160, 176).unwrap().unwrap();
+        let size = padded.size();
+        let id = gpu.add(Object::Buffer(Buffer {
+            buffer: padded,
+            size,
+        }));
+        let bytes = gpu.read_buffer(id, 0, 176);
+        assert_eq!(&bytes[..160], &[7; 160]);
+        assert_eq!(&bytes[160..], &[0; 16]);
+        assert!(gpu.padded_uniform(source, 16, 160, 160).unwrap().is_none());
+    }
+
+    #[test]
+    fn closed_buffer_survives_until_recorded_pass_finishes() {
+        let Ok(mut gpu) = Gpu::open() else { return };
+        let id = gpu.create_buffer(16);
+        gpu.pass = Some(Pass {
+            colors: Vec::new(),
+            depth: None,
+            area: [0, 0, 1, 1],
+            cmds: vec![Cmd::Vertex(0, id, 0, 16)],
+        });
+        gpu.release(id);
+        assert!(
+            gpu.buffer(id).is_some(),
+            "recorded vertex buffer was released early"
+        );
+        gpu.end_pass();
+        assert!(
+            gpu.buffer(id).is_none(),
+            "closed buffer leaked after submission"
+        );
+    }
 }
 
 impl Gpu {
@@ -366,6 +446,9 @@ impl Gpu {
             objects: HashMap::new(),
             next: 1,
             pass: None,
+            retired: Vec::new(),
+            ui_readbacks: HashMap::new(),
+            frames: 0,
             logged: HashSet::new(),
         })
     }
@@ -632,9 +715,24 @@ impl Gpu {
     /// A texture's region, tightly packed, waiting for the GPU.
     #[allow(clippy::too_many_arguments)]
     fn read_texture(&mut self, id: i64, mip: u32, x: u32, y: u32, w: u32, h: u32) -> Vec<u8> {
-        let Some(t) = self.texture(id) else {
+        let Some((staging, row, padded)) = self.texture_readback(id, mip, x, y, w, h) else {
             return Vec::new();
         };
+        let bytes = self.map(&staging);
+        Self::unpad_texture(&bytes, row, padded, h)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn texture_readback(
+        &mut self,
+        id: i64,
+        mip: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Option<(wgpu::Buffer, u32, u32)> {
+        let t = self.texture(id)?;
         let block = t
             .format
             .block_copy_size(Some(wgpu::TextureAspect::All))
@@ -671,7 +769,10 @@ impl Gpu {
             },
         );
         self.queue.submit([encoder.finish()]);
-        let bytes = self.map(&staging);
+        Some((staging, row, padded))
+    }
+
+    fn unpad_texture(bytes: &[u8], row: u32, padded: u32, h: u32) -> Vec<u8> {
         if bytes.is_empty() {
             return Vec::new();
         }
@@ -681,6 +782,53 @@ impl Gpu {
             out.extend_from_slice(&bytes[at..at + row as usize]);
         }
         out
+    }
+
+    /// Return a completed UI image or queue its copy without waiting on the render thread.
+    fn poll_ui_texture(&mut self, id: i64, mip: u32, w: u32, h: u32) -> Option<Vec<u8>> {
+        use std::sync::mpsc::{self, TryRecvError};
+        let key = (id, mip);
+        let completed = if let Some(pending) = self.ui_readbacks.get(&key) {
+            let _ = self.device.poll(wgpu::PollType::Poll);
+            let result = pending.ready.try_recv();
+            if matches!(result, Err(TryRecvError::Empty)) {
+                return None;
+            }
+            let pending = self.ui_readbacks.remove(&key)?;
+            if !matches!(result, Ok(Ok(()))) {
+                return None;
+            }
+            let bytes = {
+                let mapped = pending.buffer.get_mapped_range(..).ok()?;
+                Self::unpad_texture(&mapped, pending.row, pending.padded, pending.height)
+            };
+            pending.buffer.unmap();
+            Some(bytes)
+        } else {
+            None
+        };
+        // Keep staging memory bounded if several views are visible at once.
+        if self.ui_readbacks.len() < 8 && w > 0 && h > 0 {
+            let Some((buffer, row, padded)) = self.texture_readback(id, mip, 0, 0, w, h) else {
+                return completed;
+            };
+            let (tx, ready) = mpsc::channel();
+            buffer.map_async(wgpu::MapMode::Read, .., move |result| {
+                let _ = tx.send(result);
+            });
+            self.ui_readbacks.insert(
+                key,
+                UiReadback {
+                    buffer,
+                    ready,
+                    frame: self.frames,
+                    row,
+                    padded,
+                    height: h,
+                },
+            );
+        }
+        completed
     }
 
     /// A pass that only clears (color and/or depth), over a whole mip level.
@@ -764,8 +912,24 @@ impl Gpu {
         spv: &[u8],
         name: &str,
         used: &mut HashSet<(u32, u32)>,
+        minimums: &mut HashMap<u32, u64>,
     ) -> Result<wgpu::ShaderModule, String> {
         let module = parse(spv, used)?;
+        for (_, variable) in module.global_variables.iter() {
+            if variable.space != naga::AddressSpace::Uniform {
+                continue;
+            }
+            if let Some(binding) = &variable.binding {
+                if binding.group == 0 {
+                    if let naga::TypeInner::Struct { span, .. } = module.types[variable.ty].inner {
+                        minimums
+                            .entry(binding.binding)
+                            .and_modify(|n| *n = (*n).max(u64::from(span)))
+                            .or_insert(u64::from(span));
+                    }
+                }
+            }
+        }
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let shader = self
             .device
@@ -788,11 +952,12 @@ impl Gpu {
         use serde_json::Value;
         let name = d["name"].as_str().unwrap_or("?").to_owned();
         let mut used = HashSet::new();
+        let mut minimums = HashMap::new();
         let vertex = match vertex {
-            Some(v) => Some(self.module(v, &name, &mut used)?),
+            Some(v) => Some(self.module(v, &name, &mut used, &mut minimums)?),
             None => None,
         };
-        let fragment = self.module(fragment, &name, &mut used)?;
+        let fragment = self.module(fragment, &name, &mut used, &mut minimums)?;
         let mut buffers = Vec::new();
         for b in d["vertexBuffers"].as_array().into_iter().flatten() {
             let slot = b["slot"].as_u64().unwrap_or(0) as u32;
@@ -820,10 +985,11 @@ impl Gpu {
             .as_array()
             .into_iter()
             .flatten()
-            .map(|u| match u["type"].as_str() {
+            .enumerate()
+            .map(|(binding, u)| match u["type"].as_str() {
                 Some("COMBINED_IMAGE_SAMPLER") => Uniform::Sampler,
                 Some("TEXEL_BUFFER") => Uniform::TexelBuffer,
-                _ => Uniform::Buffer,
+                _ => Uniform::Buffer(minimums.get(&(binding as u32)).copied().unwrap_or(0)),
             })
             .collect::<Vec<_>>();
         if uniforms.contains(&Uniform::TexelBuffer) {
@@ -1022,6 +1188,56 @@ impl Gpu {
 
     /// Encodes and submits the recorded pass.
     fn end_pass(&mut self) {
+        self.submit_pass();
+        for id in std::mem::take(&mut self.retired) {
+            self.release(id);
+        }
+    }
+
+    fn finish_frame(&mut self) {
+        if self.pass.take().is_some() {
+            self.once("unclosed render pass discarded at frame boundary".into());
+        }
+        for id in std::mem::take(&mut self.retired) {
+            self.release(id);
+        }
+        // Queue writes retain staging allocations until a submission, even in frames
+        // with no Java draw passes. Poll completed work so retired resources are reclaimed.
+        self.queue.submit([]);
+        let _ = self.device.poll(wgpu::PollType::Poll);
+        self.frames += 1;
+        // A closed menu may stop polling a texture that remains alive in the client.
+        self.ui_readbacks
+            .retain(|_, read| self.frames - read.frame < 120);
+        if self.frames.is_multiple_of(100) && std::env::var_os("HORIZON_JAVA_GPU_STATS").is_some() {
+            let (count, bytes) =
+                self.objects
+                    .values()
+                    .fold((0u64, 0u64), |(count, bytes), object| {
+                        if let Object::Buffer(buffer) = object {
+                            (count + 1, bytes + buffer.size)
+                        } else {
+                            (count, bytes)
+                        }
+                    });
+            log::info!(
+                "Java GPU resources: frame={} buffers={count} buffer_bytes={bytes} objects={}",
+                self.frames,
+                self.objects.len()
+            );
+        }
+    }
+
+    fn release(&mut self, id: i64) {
+        self.ui_readbacks.retain(|(texture, _), _| *texture != id);
+        if self.pass.is_some() {
+            self.retired.push(id);
+        } else if let Some(Object::Texture(t)) = self.objects.remove(&id) {
+            t.texture.destroy();
+        }
+    }
+
+    fn submit_pass(&mut self) {
         let Some(pass) = self.pass.take() else {
             return;
         };
@@ -1304,6 +1520,41 @@ impl Gpu {
         }
     }
 
+    /// Naga rounds uniform blocks more strictly than Vulkan's member reads. Copy a
+    /// short bound range into zero padding rather than exposing the next ring allocation.
+    fn padded_uniform(
+        &self,
+        id: i64,
+        offset: u64,
+        len: u64,
+        minimum: u64,
+    ) -> Result<Option<wgpu::Buffer>, String> {
+        if len >= minimum {
+            return Ok(None);
+        }
+        let source = self.buffer(id).ok_or("a closed buffer")?;
+        if offset.saturating_add(len) > source.size
+            || !offset.is_multiple_of(4)
+            || !len.is_multiple_of(4)
+        {
+            return Err("invalid uniform buffer range".into());
+        }
+        let padded = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Java mods' padded uniform"),
+            size: minimum.div_ceil(16) * 16,
+            usage: wgpu::BufferUsages::UNIFORM
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        if len > 0 {
+            let mut encoder = self.device.create_command_encoder(&Default::default());
+            encoder.copy_buffer_to_buffer(&source.buffer, offset, &padded, 0, len);
+            self.queue.submit([encoder.finish()]);
+        }
+        Ok(Some(padded))
+    }
+
     fn bind_groups(
         &self,
         current: &(
@@ -1321,24 +1572,44 @@ impl Gpu {
             let mut bindings: Vec<u32> =
                 used.iter().filter(|u| u.0 == group).map(|u| u.1).collect();
             bindings.sort();
+            let mut padded = HashMap::new();
+            if group == 0 {
+                for binding in &bindings {
+                    if let (Some(Uniform::Buffer(minimum)), Some(Bound::Buffer(id, offset, len))) =
+                        (kinds.get(*binding as usize), uniforms.get(binding))
+                    {
+                        if let Some(buffer) = self.padded_uniform(*id, *offset, *len, *minimum)? {
+                            padded.insert(*binding, buffer);
+                        }
+                    }
+                }
+            }
             for binding in bindings {
                 let kind = kinds
                     .get(binding as usize)
                     .copied()
-                    .unwrap_or(Uniform::Buffer);
+                    .unwrap_or(Uniform::Buffer(0));
                 let bound = uniforms
                     .get(&binding)
                     .ok_or(format!("uniform {binding} unbound"))?;
                 let resource = match (group, kind, bound) {
-                    (0, Uniform::Buffer, Bound::Buffer(id, offset, len)) => {
+                    (0, Uniform::Buffer(_), Bound::Buffer(id, offset, len)) => {
                         let b = self.buffer(*id).ok_or("a closed buffer")?;
                         wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                            buffer: &b.buffer,
-                            offset: *offset,
+                            buffer: padded.get(&binding).unwrap_or(&b.buffer),
+                            offset: if padded.contains_key(&binding) {
+                                0
+                            } else {
+                                *offset
+                            },
                             size: std::num::NonZeroU64::new(
-                                len.div_ceil(16)
-                                    .saturating_mul(16)
-                                    .min(b.size.saturating_sub(*offset)),
+                                if let Some(buffer) = padded.get(&binding) {
+                                    buffer.size()
+                                } else {
+                                    len.div_ceil(16)
+                                        .saturating_mul(16)
+                                        .min(b.size.saturating_sub(*offset))
+                                },
                             ),
                         })
                     }
@@ -1357,11 +1628,16 @@ impl Gpu {
                 };
                 entries.push(wgpu::BindGroupEntry { binding, resource });
             }
-            out.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let made = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
                 layout: &current.0.get_bind_group_layout(group),
                 entries: &entries,
-            }));
+            });
+            if let Some(error) = pollster::block_on(scope.pop()) {
+                return Err(error_text(&error));
+            }
+            out.push(made);
         }
         Ok(out)
     }
@@ -1526,11 +1802,7 @@ extern "system" fn native_buffer(_: JNIEnv, _: JClass, size: jlong) -> jlong {
 }
 
 extern "system" fn native_release(_: JNIEnv, _: JClass, id: jlong) {
-    with((), |g| {
-        if let Some(Object::Texture(t)) = g.objects.remove(&id) {
-            t.texture.destroy();
-        }
-    })
+    with((), |g| g.release(id))
 }
 
 extern "system" fn native_write_buffer(
@@ -1648,6 +1920,22 @@ extern "system" fn native_read_texture<'l>(
     env.byte_array_from_slice(&bytes)
         .map(|a| a.into_raw())
         .unwrap_or(std::ptr::null_mut())
+}
+
+extern "system" fn native_poll_ui_texture<'l>(
+    env: JNIEnv<'l>,
+    _: JClass<'l>,
+    id: jlong,
+    mip: jint,
+    w: jint,
+    h: jint,
+) -> jni::sys::jbyteArray {
+    let bytes = with(None, |g| {
+        g.poll_ui_texture(id, mip as u32, w as u32, h as u32)
+    });
+    bytes
+        .and_then(|bytes| env.byte_array_from_slice(&bytes).ok())
+        .map_or(std::ptr::null_mut(), |array| array.into_raw())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1817,6 +2105,10 @@ extern "system" fn native_end_pass(_: JNIEnv, _: JClass) {
     with((), Gpu::end_pass)
 }
 
+extern "system" fn native_end_frame(_: JNIEnv, _: JClass) {
+    with((), Gpu::finish_frame)
+}
+
 extern "system" fn native_set_pipeline(_: JNIEnv, _: JClass, id: jlong) {
     record(Cmd::Pipeline(id))
 }
@@ -1933,6 +2225,11 @@ pub(crate) fn register(env: &mut JNIEnv) -> jni::errors::Result<()> {
                 native_read_texture as *mut c_void,
             ),
             m(
+                "pollUiTexture",
+                "(JIII)[B",
+                native_poll_ui_texture as *mut c_void,
+            ),
+            m(
                 "copyTexture",
                 "(JJIIIIIII)V",
                 native_copy_texture as *mut c_void,
@@ -1949,6 +2246,7 @@ pub(crate) fn register(env: &mut JNIEnv) -> jni::errors::Result<()> {
                 native_begin_pass as *mut c_void,
             ),
             m("endPass", "()V", native_end_pass as *mut c_void),
+            m("endFrame", "()V", native_end_frame as *mut c_void),
             m("setPipeline", "(J)V", native_set_pipeline as *mut c_void),
             m("setUniform", "(IIJJJ)V", native_set_uniform as *mut c_void),
             m("setVertex", "(IJJJ)V", native_set_vertex as *mut c_void),

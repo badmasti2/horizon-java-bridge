@@ -37,6 +37,7 @@ public final class Gpu {
 
     /** The texture's region, tightly packed (waiting for the GPU). */
     public static native byte[] readTexture(long texture, int mip, int x, int y, int width, int height);
+    public static native byte[] pollUiTexture(long texture, int mip, int width, int height);
 
     public static native void copyTexture(long source, long target, int mip, int targetX, int targetY,
                                           int sourceX, int sourceY, int width, int height);
@@ -52,6 +53,7 @@ public final class Gpu {
                                         int x, int y, int width, int height);
 
     public static native void endPass();
+    public static native void endFrame();
 
     public static native void setPipeline(long pipeline);
 

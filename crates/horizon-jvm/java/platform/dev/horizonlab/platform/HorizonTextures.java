@@ -74,6 +74,10 @@ public final class HorizonTextures {
             super(Identifier.parse(view.name()));
             this.textureView = view;
             this.texture = new Texture(view);
+            if (HorizonGpu.installed() && view.name().startsWith("minecraft:textures/entity/player/")) {
+                this.sampler = com.mojang.blaze3d.systems.RenderSystem.getSamplerCache()
+                        .getRepeat(com.mojang.renderpearl.api.textures.FilterMode.NEAREST);
+            }
         }
     }
 

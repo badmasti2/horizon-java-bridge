@@ -53,11 +53,13 @@
     "defaultRequire": 1
   },
   "client": [
+    "KeyboardHandlerMixin",
     "ClientChatMixin",
     "SkinDownloaderMixin",
     "LocalPlayerMessagesMixin",
     "HudMixin",
     "GuiMixin",
+    "AbstractWidgetMixin",
     "ScreenMixin",
     "MinecraftCameraMixin",
     "CameraMixin",

@@ -130,12 +130,17 @@ public final class HorizonGpu implements GpuDeviceBackend {
         // What Minecraft's frame does at its end: the per-frame uniform rings start over,
         // fenced tasks run, transient memory is reused.
         try {
+            var buffers = (net.minecraft.client.renderer.RenderBuffers) HorizonClient.field(
+                    net.minecraft.client.renderer.GameRenderer.class,
+                    net.minecraft.client.Minecraft.getInstance().gameRenderer, "renderBuffers");
+            if (buffers != null) buffers.endFrame();
             com.mojang.blaze3d.systems.RenderSystem.getDynamicUniforms().reset();
             com.mojang.blaze3d.systems.RenderSystem.executePendingTasks();
         } catch (Throwable t) {
             Natives.log("Horizon's client: the GPU frame's end failed: " + t);
         }
         device.encoder.submit();
+        Gpu.endFrame();
     }
 
     // ---- Objects --------------------------------------------------------------------------
@@ -204,12 +209,21 @@ public final class HorizonGpu implements GpuDeviceBackend {
     }
 
     static class Buffer extends BaseGpuBuffer {
+        private static final java.lang.ref.Cleaner CLEANER = java.lang.ref.Cleaner.create();
         final long id;
+        private final java.lang.ref.Cleaner.Cleanable cleanup;
         private boolean closed;
 
         Buffer(long id, int usage, long size) {
+            this(id, usage, size, true);
+        }
+
+        Buffer(long id, int usage, long size, boolean owned) {
             super(usage, size);
             this.id = id;
+            // Recorded passes retain native ids; native release defers them until submission.
+            // Borrowed transient slices share their block's ownership and must not free it.
+            cleanup = owned ? CLEANER.register(this, () -> Gpu.release(id)) : null;
         }
 
         @Override
@@ -221,7 +235,7 @@ public final class HorizonGpu implements GpuDeviceBackend {
         public void close() {
             if (!closed) {
                 closed = true;
-                Gpu.release(id);
+                if (cleanup != null) cleanup.clean();
             }
         }
 
@@ -495,7 +509,7 @@ public final class HorizonGpu implements GpuDeviceBackend {
     /** A slice of a transient block, as renderpearl's transient buffers are (not mappable). */
     static final class TransientBuffer extends Buffer {
         TransientBuffer(Buffer block, int usage) {
-            super(block.id, usage, block.size());
+            super(block.id, usage, block.size(), false);
         }
 
         @Override
@@ -911,9 +925,15 @@ public final class HorizonGpu implements GpuDeviceBackend {
      * which its GUI blits flip with their UVs), or null.
      */
     static byte[] pixels(GpuTextureView view) {
-        if (!(view instanceof View v) || v.isClosed() || !(v.texture() instanceof Texture t)) return null;
+        return pixels(view, false);
+    }
+
+    static byte[] pixels(GpuTextureView view, boolean async) {
+        if (!(view instanceof View v) || !(v.texture() instanceof Texture t) || t.isClosed()) return null;
         if (t.getFormat() != GpuFormat.RGBA8_UNORM) return null;
         int mip = v.baseMipLevel();
+        if (async) return Gpu.pollUiTexture(t.id, mip, t.getWidth(mip), t.getHeight(mip));
         return Gpu.readTexture(t.id, mip, 0, 0, t.getWidth(mip), t.getHeight(mip));
     }
+
 }

@@ -16,9 +16,13 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  */
 @Mixin(SkinTextureDownloader.class)
 public abstract class SkinDownloaderMixin {
+    @org.spongepowered.asm.mixin.Shadow @org.spongepowered.asm.mixin.Final
+    private net.minecraft.client.renderer.texture.TextureManager textureManager;
     @Inject(method = "downloadAndRegisterSkin", at = @At("HEAD"), cancellable = true)
     private void horizon$noDownload(Identifier id, java.nio.file.Path file, String url, boolean legacy,
                                     CallbackInfoReturnable<CompletableFuture<ClientAsset.Texture>> cir) {
-        if (HorizonClient.headless()) cir.setReturnValue(CompletableFuture.completedFuture(new ClientAsset.DownloadedTexture(id, url)));
+        if (HorizonClient.headless() && textureManager == null) {
+            cir.setReturnValue(CompletableFuture.completedFuture(new ClientAsset.DownloadedTexture(id, url)));
+        }
     }
 }

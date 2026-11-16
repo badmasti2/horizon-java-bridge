@@ -222,13 +222,28 @@ public final class HorizonWorldgen {
         set(StructureTemplateManager.class, templates, "sources", List.of(source));
         set(StructureTemplateManager.class, templates, "structureRepository", new ConcurrentHashMap<>());
         set(MinecraftServer.class, server, "structureTemplateManager", templates);
-        // Handlers that take only the CallbackInfo, then those that take the constructor's
-        // arguments (WorldWeaver's: its registry-ready and server-ready events).
+        // A single constructor call includes callback-only and argument-taking handlers.
         Object[] args = serverArguments(server, seed, structures);
         long hooks = System.nanoTime();
         for (String at : new String[] {"RETURN", "TAIL"}) {
-            HorizonHooks.fire(server, MinecraftServer.class, "<init>", "()V", at, new Object[0], null, false);
-            if (args != null) HorizonHooks.fire(server, MinecraftServer.class, "<init>", SERVER_CONSTRUCTOR, at, args, null, false);
+            HorizonHooks.fire(server, MinecraftServer.class, "<init>", args == null ? "()V" : SERVER_CONSTRUCTOR,
+                    at, args == null ? new Object[0] : args, null, false);
+        }
+        if (HorizonServer.client && server instanceof net.minecraft.client.server.IntegratedServer integrated) {
+            var client = HorizonClient.minecraft();
+            var type = net.minecraft.client.server.IntegratedServer.class;
+            set(type, integrated, "minecraft", client);
+            // The mirror skips vanilla's constructor. Null scope reports as published.
+            set(type, integrated, "multiplayerScope", MinecraftServer.MultiplayerScope.OFF);
+            set(type, integrated, "publishedPort", -1);
+            HorizonHooks.initFields(integrated);
+            if (args != null) {
+                Object[] integratedArgs = {args[0], client, args[1], args[2], args[3], args[4], args[7], args[8]};
+                for (String at : new String[] {"RETURN", "TAIL"}) {
+                    HorizonHooks.fire(integrated, net.minecraft.client.server.IntegratedServer.class, "<init>",
+                            INTEGRATED_CONSTRUCTOR, at, integratedArgs, null, false);
+                }
+            }
         }
         // Fabric's biome modifications and TerraBlender's server start run here.
         Natives.log("Java mods: the server's start hooks (biome modifications) ran in "
@@ -240,6 +255,11 @@ public final class HorizonWorldgen {
             + "Lnet/minecraft/server/packs/repository/PackRepository;Lnet/minecraft/server/WorldStem;"
             + "Ljava/util/Optional;Ljava/net/Proxy;Lcom/mojang/datafixers/DataFixer;Lnet/minecraft/server/Services;"
             + "Lnet/minecraft/server/level/progress/LevelLoadListener;ZLnet/minecraft/server/notifications/NotificationManager;)V";
+
+    private static final String INTEGRATED_CONSTRUCTOR = "(Ljava/lang/Thread;Lnet/minecraft/client/Minecraft;"
+            + "Lnet/minecraft/world/level/storage/LevelStorageSource$LevelStorageAccess;"
+            + "Lnet/minecraft/server/packs/repository/PackRepository;Lnet/minecraft/server/WorldStem;"
+            + "Ljava/util/Optional;Lnet/minecraft/server/Services;Lnet/minecraft/server/level/progress/LevelLoadListener;)V";
 
     /**
      * MinecraftServer's constructor's arguments as a server would have them: the world's

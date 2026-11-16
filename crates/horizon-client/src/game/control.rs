@@ -579,6 +579,8 @@ impl Game<'_> {
                     }
                     return ok();
                 }
+                #[cfg(feature = "java-mods")]
+                if self.java_title_scripted_key(key, action) { return ok(); }
                 self.require_world()?;
                 // KeyboardHandler.keyPress: the open screen's narration hears it.
                 super::narrator::narrate_key(&mut self.narration, key, arg(2)? != "up");

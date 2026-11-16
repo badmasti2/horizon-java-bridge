@@ -305,6 +305,7 @@ fn platform(manifest: &Path, out: &Path, libs: &[PathBuf], bridge_classes: &Path
         "fabric.mod.json",
         "horizon-platform.mixins.json",
         "horizon-platform-mods.mixins.json",
+        "horizon-icon.png",
     ] {
         zip.start_file(resource, options).unwrap();
         zip.write_all(&std::fs::read(sources_dir.join(resource)).unwrap())

@@ -15,6 +15,35 @@ public final class HorizonClient {
     private HorizonClient() {}
 
     private static Minecraft minecraft;
+    private static java.util.concurrent.CompletableFuture<com.mojang.authlib.GameProfile> launcherSkinProfile;
+
+    /** The launcher profile's signed textures are resolved independently of UI rendering. */
+    public static java.util.concurrent.CompletableFuture<com.mojang.authlib.GameProfile> launcherSkinProfile(
+            com.mojang.authlib.GameProfile profile) {
+        if (launcherSkinProfile == null) return null;
+        if (profile.id().equals(minecraft.getUser().getProfileId())) return launcherSkinProfile;
+        // Integrated play uses the world's offline UUID for the local player.
+        return profile.id().equals(HorizonDeviceMods.own)
+                && profile.name().equals(minecraft.getUser().getName())
+                && profile.id().equals(net.minecraft.core.UUIDUtil.createOfflinePlayerUUID(profile.name()))
+                ? launcherSkinProfile : null;
+    }
+    private static net.minecraft.client.DeltaTracker.Timer frameTimer;
+
+    /** A real vanilla timer retains accessors and fields added by client mods. */
+    public static net.minecraft.client.DeltaTracker deltaTracker() {
+        var uiTimer = HorizonTitle.activeTimer();
+        if (uiTimer != null) return uiTimer;
+        if (frameTimer == null) {
+            frameTimer = new net.minecraft.client.DeltaTracker.Timer(20, net.minecraft.util.Util.getMillis(), value -> value);
+            try {
+                set(net.minecraft.client.DeltaTracker.Timer.class, frameTimer, "deltaTicks", 1F);
+                set(net.minecraft.client.DeltaTracker.Timer.class, frameTimer, "deltaTickResidual", 1F);
+                set(net.minecraft.client.DeltaTracker.Timer.class, frameTimer, "realtimeDeltaTicks", 1F);
+            } catch (ReflectiveOperationException e) { throw new IllegalStateException(e); }
+        }
+        return frameTimer;
+    }
 
     /** Called by FabricBoot on the client side, before the client entrypoints (finish after). */
     public static void boot(String gameDir) throws ReflectiveOperationException {
@@ -32,14 +61,65 @@ public final class HorizonClient {
         // thread runs: tasks().
         set(net.minecraft.util.thread.BlockableEventLoop.class, mc, "pendingRunnables",
                 new java.util.concurrent.ConcurrentLinkedQueue<Runnable>());
-        // The signed-in user (JEI keys its config folders by the profile id): an offline one,
-        // as the window's player is to the mirror.
-        String name = "Player";
+        set(Minecraft.class, mc, "gameThread", Thread.currentThread());
+        // Use the launcher's session before any mod initializer reads the client's identity.
+        var session = dev.horizonlab.bridge.fabric.FabricBoot.takeClientSession();
+        String name = session == null ? "Player" : session[0];
         set(Minecraft.class, mc, "user", new net.minecraft.client.User(name,
-                net.minecraft.core.UUIDUtil.createOfflinePlayerUUID(name), "", java.util.Optional.empty(), java.util.Optional.empty()));
+                session == null ? net.minecraft.core.UUIDUtil.createOfflinePlayerUUID(name) : java.util.UUID.fromString(session[1]),
+                session == null ? "" : session[2], session == null || session[3].isEmpty() ? java.util.Optional.empty()
+                        : java.util.Optional.of(session[3]), java.util.Optional.empty()));
+        set(Minecraft.class, mc, "profileFuture", java.util.concurrent.CompletableFuture.completedFuture(null));
+        set(Minecraft.class, mc, "userPropertiesFuture", java.util.concurrent.CompletableFuture.completedFuture(
+                com.mojang.authlib.minecraft.UserApiService.OFFLINE_PROPERTIES));
+        set(Minecraft.class, mc, "userApiService", com.mojang.authlib.minecraft.UserApiService.OFFLINE);
+        set(Minecraft.class, mc, "services", HorizonServices.get());
+        if (session != null) {
+            var discovery = com.mojang.authlib.services.MinecraftServicesDiscoveryService.create(java.net.Proxy.NO_PROXY);
+            var api = discovery.createUserApiService(session[2]);
+            set(Minecraft.class, mc, "userApiService", api);
+            set(Minecraft.class, mc, "profileFuture", java.util.concurrent.CompletableFuture.completedFuture(
+                    new com.mojang.authlib.services.ProfileResult(new com.mojang.authlib.GameProfile(
+                            java.util.UUID.fromString(session[1]), name))));
+            set(Minecraft.class, mc, "userPropertiesFuture", java.util.concurrent.CompletableFuture.supplyAsync(() -> {
+                try { return api.fetchProperties(); }
+                catch (com.mojang.authlib.exceptions.AuthenticationException e) {
+                    Natives.log("Java client: account properties unavailable (" + e.getClass().getSimpleName() + ")");
+                    return com.mojang.authlib.minecraft.UserApiService.OFFLINE_PROPERTIES;
+                }
+            }));
+            var offline = HorizonServices.get();
+            var sessionService = discovery.createMinecraftSessionService();
+            var profileId = java.util.UUID.fromString(session[1]);
+            launcherSkinProfile = java.util.concurrent.CompletableFuture.supplyAsync(() -> {
+                var result = sessionService.fetchProfile(profileId, true);
+                return result == null ? null : result.profile();
+            }).exceptionally(failure -> null);
+            set(Minecraft.class, mc, "services", new net.minecraft.server.Services(sessionService,
+                    discovery.getServicesKeySet(), discovery.createProfileRepository(), offline.nameToIdCache(), offline.profileResolver()));
+        }
+        var social = Natives.allocate(net.minecraft.client.gui.screens.social.PlayerSocialManager.class);
+        HorizonServer.emptyCollections(social, net.minecraft.client.gui.screens.social.PlayerSocialManager.class);
+        set(net.minecraft.client.gui.screens.social.PlayerSocialManager.class, social, "minecraft", mc);
+        set(net.minecraft.client.gui.screens.social.PlayerSocialManager.class, social, "service",
+                field(Minecraft.class, mc, "userApiService"));
+        var friendsService = com.mojang.authlib.services.MinecraftServicesDiscoveryService
+                .createOffline(java.net.Proxy.NO_PROXY).createFriendsService("");
+        var friendUpdates = new net.minecraft.client.gui.screens.social.RemoteFriendListUpdateHandler(friendsService, mc);
+        set(net.minecraft.client.gui.screens.social.PlayerSocialManager.class, social, "remoteFriendListUpdateHandler", friendUpdates);
+        set(Minecraft.class, mc, "remoteFriendListUpdateHandler", friendUpdates);
+        set(Minecraft.class, mc, "playerSocialManager", social);
+        var reportingContext = net.minecraft.client.multiplayer.chat.report.ReportingContext.create(
+                net.minecraft.client.multiplayer.chat.report.ReportEnvironment.local(),
+                (com.mojang.authlib.minecraft.UserApiService) field(Minecraft.class, mc, "userApiService"));
+        set(Minecraft.class, mc, "reportingContext", reportingContext);
         // The resource pack list, made by Minecraft's constructor before the client entrypoints:
         // a mod's initializer adds its pack source to it (Simple Voice Chat's: it was null).
         set(Minecraft.class, mc, "resourcePackRepository", new net.minecraft.server.packs.repository.PackRepository());
+        // Initializers register vanilla reload listeners before the first client tick.
+        // Keep this manager when mounting packs so those registrations survive.
+        set(Minecraft.class, mc, "resourceManager", new net.minecraft.server.packs.resources.ReloadableResourceManager(
+                net.minecraft.server.packs.PackType.CLIENT_RESOURCES));
         HorizonServer.client = true;
     }
 
@@ -52,13 +132,20 @@ public final class HorizonClient {
      * Thread.currentThread(): EntrypointPatch): the mods' injections there, before (FabricBoot,
      * just before the main entrypoints) or after (after the client ones).
      */
-    public static void gameStart(boolean after) {
+    public static void gameStart(boolean after) throws ReflectiveOperationException {
         HorizonHooks.scanNow();
+        // The mirror skips Minecraft's constructor, including fields added by mixins.
+        // Supply their initializers before any startup handler reads those fields.
+        HorizonHooks.initFields(minecraft);
+        HorizonClientExecutors.initialize(minecraft);
         HorizonHooks.fireClient(minecraft, after ? HorizonHooks.START_AFTER : HorizonHooks.START_BEFORE);
     }
 
     /** Minecraft's constructor at its options, after the registries' freeze (FabricBoot). */
     public static void optionsStart() {
+        // Retry initializers that needed services installed by finish().
+        HorizonHooks.initFields(minecraft);
+        HorizonHooks.fireClient(minecraft, HorizonHooks.START_RESOURCES);
         HorizonHooks.fireClient(minecraft, HorizonHooks.START_OPTIONS);
         HorizonHooks.fireClient(minecraft, HorizonHooks.START_END);
     }
@@ -89,6 +176,7 @@ public final class HorizonClient {
         HorizonDeviceMods.startScan();
         // options.txt is brought up to date by the game's data fixer, as the server's saves are.
         set(Minecraft.class, mc, "fixerUpper", net.minecraft.util.datafix.DataFixers.getDataFixer());
+        HorizonHooks.fireClient(mc, HorizonHooks.START_FIXER);
         // The GPU device first, as Minecraft's constructor makes its window and device before
         // its options: options.txt's load asks the device (its anisotropy, mods' options read
         // RenderSystem.getDevice(): "Can't getDevice() before it was initialized").
@@ -109,6 +197,11 @@ public final class HorizonClient {
         // Minecraft's constructor has its window before its options. Before, every start logged
         // "Failed to load options" (Options.forceUnicodeFont() on null).
         set(Minecraft.class, mc, "window", Natives.allocate(com.mojang.blaze3d.platform.Window.class));
+        // Options listeners can ask gui.screen() while options.txt is being read.
+        // Keep this same GUI when its HUD and services are filled in below.
+        var gui = (net.minecraft.client.gui.Gui) Natives.allocate(net.minecraft.client.gui.Gui.class);
+        set(net.minecraft.client.gui.Gui.class, gui, "minecraft", mc);
+        set(Minecraft.class, mc, "gui", gui);
         try {
             var early = (net.minecraft.client.Options) Natives.allocate(net.minecraft.client.Options.class);
             set(net.minecraft.client.Options.class, early, "forceUnicodeFont",
@@ -117,7 +210,17 @@ public final class HorizonClient {
         } catch (Throwable t) {
             Natives.log("Horizon's client: no options for the options' load: " + t);
         }
-        set(Minecraft.class, mc, "options", new net.minecraft.client.Options(mc, mc.gameDirectory));
+        // OptionInstance.set stores values without runtime callbacks while Minecraft is
+        // starting. The mirror sets running early for mod threads; pause it for this load
+        // so options do not resize an unfinished GUI or reach absent sound services.
+        boolean wasRunning = mc.isRunning();
+        set(Minecraft.class, mc, "running", false);
+        try {
+            set(Minecraft.class, mc, "options", new net.minecraft.client.Options(mc, mc.gameDirectory));
+        } finally {
+            set(Minecraft.class, mc, "running", wasRunning);
+        }
+        set(Minecraft.class, mc, "tutorial", new net.minecraft.client.tutorial.Tutorial(mc, mc.options));
         // Key names in text (Component.keybind: Create's "Release Right Button to Confirm"), as
         // Minecraft's constructor sets them: the key bindings' names, not their ids.
         net.minecraft.network.chat.contents.KeybindResolver.setKeyResolver(KeyMapping::createNameSupplier);
@@ -131,19 +234,25 @@ public final class HorizonClient {
         set(Minecraft.class, mc, "narrator", narrator);
         set(Minecraft.class, mc, "atlasManager", atlases());
         // Its textures: named, never uploaded (TextureManagerMixin, HorizonTextures).
-        var textures = Natives.allocate(net.minecraft.client.renderer.texture.TextureManager.class);
+        var textures = (net.minecraft.client.renderer.texture.TextureManager)
+                Natives.allocate(net.minecraft.client.renderer.texture.TextureManager.class);
         // Its maps, empty (mods' accessors read them: JourneyMap's getTex).
         set(net.minecraft.client.renderer.texture.TextureManager.class, textures, "byPath", new java.util.HashMap<>());
         set(net.minecraft.client.renderer.texture.TextureManager.class, textures, "tickableTextures", new java.util.HashSet<>());
         set(Minecraft.class, mc, "textureManager", textures);
-        // Its skins: each profile's default (SkinManagerMixin).
-        var skins = Natives.allocate(net.minecraft.client.resources.SkinManager.class);
-        // Its downloader (FrozenLib's capes): downloads nothing (SkinDownloaderMixin).
-        set(net.minecraft.client.resources.SkinManager.class, skins, "skinTextureDownloader",
-                Natives.allocate(net.minecraft.client.renderer.texture.SkinTextureDownloader.class));
+        net.minecraft.client.resources.SkinManager skins;
+        if (launcherSkinProfile != null && HorizonGpu.installed()) {
+            var downloader = new net.minecraft.client.renderer.texture.SkinTextureDownloader(
+                    java.net.Proxy.NO_PROXY, textures, mc);
+            skins = new net.minecraft.client.resources.SkinManager(
+                    mc.gameDirectory.toPath().resolve(".horizon-cache").resolve("skins"), mc.services(), downloader, mc);
+        } else {
+            skins = (net.minecraft.client.resources.SkinManager) Natives.allocate(net.minecraft.client.resources.SkinManager.class);
+            set(net.minecraft.client.resources.SkinManager.class, skins, "skinTextureDownloader",
+                    Natives.allocate(net.minecraft.client.renderer.texture.SkinTextureDownloader.class));
+        }
         set(Minecraft.class, mc, "skinManager", skins);
         // The in-game GUI's object (screens reach its HUD), made without its constructor.
-        var gui = (net.minecraft.client.gui.Gui) Natives.allocate(net.minecraft.client.gui.Gui.class);
         var hud = (net.minecraft.client.gui.Hud) Natives.allocate(net.minecraft.client.gui.Hud.class);
         // What the HUD's parts mods draw over read (HorizonClient.hud): the client, a random
         // (the hearts' jitter).
@@ -679,25 +788,30 @@ public final class HorizonClient {
 
     /** The headless window's size: Horizon's GUI size, at scale 3 (1280x720's). */
     static void windowSize() {
+        windowSize(width * 3, height * 3, 3);
+    }
+
+    static void windowSize(int pixelWidth, int pixelHeight, int scale) {
         try {
             var window = minecraft.getWindow();
             if (window == null) return;
             Class<?> owner = com.mojang.blaze3d.platform.Window.class;
-            int scale = 3;
-            for (String f : new String[] {"width", "framebufferWidth", "windowedWidth"}) set(owner, window, f, width * scale);
-            for (String f : new String[] {"height", "framebufferHeight", "windowedHeight"}) set(owner, window, f, height * scale);
+            for (String f : new String[] {"width", "framebufferWidth", "windowedWidth"}) set(owner, window, f, pixelWidth);
+            for (String f : new String[] {"height", "framebufferHeight", "windowedHeight"}) set(owner, window, f, pixelHeight);
             set(owner, window, "guiScaledWidth", width);
             set(owner, window, "guiScaledHeight", height);
             set(owner, window, "guiScale", scale);
             set(owner, window, "focused", true);
-            set(owner, window, "monitorManager", Natives.allocate(HorizonMonitors.class));
+            if (field(owner, window, "monitorManager") == null) {
+                set(owner, window, "monitorManager", Natives.allocate(HorizonMonitors.class));
+            }
         } catch (ReflectiveOperationException e) {
             Natives.log("Horizon's client: the window's size could not be set: " + e);
         }
     }
 
     /** Sets whether the mouse is grabbed (the window active too, once): what it was. */
-    private static boolean grabMouse(boolean grabbed) {
+    static boolean grabMouse(boolean grabbed) {
         try {
             if (minecraft.mouseHandler == null) mouseAt(0, 0);
             boolean was = minecraft.mouseHandler.isMouseGrabbed();
@@ -714,21 +828,21 @@ public final class HorizonClient {
      * arguments: REI's recipe view), in the window's pixels (its scale is 3).
      */
     static void mouseAt(double guiX, double guiY) {
+        mouseAt(guiX, guiY, 3);
+    }
+
+    static void mouseAt(double guiX, double guiY, int scale) {
         try {
             if (minecraft.mouseHandler == null) {
-                var mouse = Natives.allocate(net.minecraft.client.MouseHandler.class);
-                set(net.minecraft.client.MouseHandler.class, mouse, "minecraft", minecraft);
-                set(Minecraft.class, minecraft, "mouseHandler", mouse);
+                set(Minecraft.class, minecraft, "mouseHandler", new net.minecraft.client.MouseHandler(minecraft));
             }
             // Its keyboard handler too: text boxes focused by a click resubmit its IME preedit
             // (none here).
             if (minecraft.keyboardHandler == null) {
-                var keyboard = Natives.allocate(net.minecraft.client.KeyboardHandler.class);
-                set(net.minecraft.client.KeyboardHandler.class, keyboard, "minecraft", minecraft);
-                set(Minecraft.class, minecraft, "keyboardHandler", keyboard);
+                set(Minecraft.class, minecraft, "keyboardHandler", new net.minecraft.client.KeyboardHandler(minecraft));
             }
-            set(net.minecraft.client.MouseHandler.class, minecraft.mouseHandler, "xpos", guiX * 3);
-            set(net.minecraft.client.MouseHandler.class, minecraft.mouseHandler, "ypos", guiY * 3);
+            set(net.minecraft.client.MouseHandler.class, minecraft.mouseHandler, "xpos", guiX * scale);
+            set(net.minecraft.client.MouseHandler.class, minecraft.mouseHandler, "ypos", guiY * scale);
         } catch (ReflectiveOperationException e) {
             Natives.log("Horizon's client: no mouse: " + e);
         }
@@ -1077,6 +1191,7 @@ public final class HorizonClient {
             if (minecraft.gameMode != null) {
                 set(net.minecraft.client.multiplayer.MultiPlayerGameMode.class, minecraft.gameMode, "connection", connection);
             }
+            HorizonHooks.initFields(connection);
             searchConnection = connection;
         } catch (Throwable t) {
             Natives.log("Horizon's client: no client connection: " + t);
@@ -1152,6 +1267,9 @@ public final class HorizonClient {
         Class<?> owner = net.minecraft.client.multiplayer.ClientPacketListener.class;
         set(owner, connection, "playerInfoMap", new java.util.concurrent.ConcurrentHashMap<>());
         set(owner, connection, "listedPlayers", new java.util.LinkedHashSet<>());
+        Class<?> common = net.minecraft.client.multiplayer.ClientCommonPacketListenerImpl.class;
+        set(common, connection, "seenPlayers", new java.util.concurrent.ConcurrentHashMap<>());
+        set(common, connection, "serverLinks", net.minecraft.server.ServerLinks.EMPTY);
     }
 
     /** Runs {@code run} with the player's own client player as Minecraft.player. */
@@ -1299,6 +1417,10 @@ public final class HorizonClient {
         HorizonDeviceMods.RUN_THEIR_OWN.remove(id);
         HorizonLoop.forget(id);
         CLIENT_CHUNKS.remove(id);
+        HUD_SENT.remove(id);
+        HUD_DRAWN.remove(id);
+        HUD_LOOK.remove(id);
+        CONNECTIONS.remove(id);
         HorizonClientState.forget(id);
         var overlay = OVERLAYS.remove(id);
         OVERLAY_SENT.remove(id);
@@ -1312,6 +1434,35 @@ public final class HorizonClient {
             }
         }
         if (SCREENS.containsKey(id)) closeScreen(id);
+        var local = PLAYERS.remove(id);
+        if (local != null) SERVER_PLAYERS.remove(local);
+    }
+
+    /** The integrated client leaves before the next connection can start. */
+    static void worldClosed() {
+        var id = HorizonDeviceMods.own;
+        if (id == null || minecraft == null) return;
+        var player = HorizonServer.player(id);
+        try {
+            if (player != null) as(player, () -> HorizonHooks.fire(minecraft, Minecraft.class, "disconnect",
+                    "(Lnet/minecraft/client/gui/screens/Screen;ZZ)V", "HEAD",
+                    new Object[] {null, false, false}, null, true));
+        } catch (Throwable t) {
+            Natives.log("Horizon's client: integrated disconnect hook failed: " + t);
+        }
+        try {
+            left(id);
+        } catch (Throwable t) {
+            Natives.log("Horizon's client: integrated disconnect cleanup failed: " + t);
+        } finally {
+            minecraft.level = null;
+        }
+        try {
+            set(Minecraft.class, minecraft, "player", null);
+            set(Minecraft.class, minecraft, "singleplayerServer", null);
+        } catch (ReflectiveOperationException e) {
+            Natives.log("Horizon's client: integrated player cleanup failed: " + e);
+        }
     }
 
     interface ThrowingRunnable {
@@ -1407,6 +1558,14 @@ public final class HorizonClient {
      * it as a menu's (Natives.clientScreen, then frames).
      */
     public static void setScreen(net.minecraft.client.gui.screens.Screen screen) {
+        if (HorizonTitle.active()) {
+            try {
+                HorizonTitle.setScreen(screen);
+            } catch (ReflectiveOperationException e) {
+                throw new IllegalStateException("Cannot initialize a title mod screen", e);
+            }
+            return;
+        }
         // A device client's screen (its player's own game shows it: HorizonDeviceClient).
         if (HorizonDeviceClient.on()) {
             HorizonDeviceClient.setScreen(screen);
@@ -1876,7 +2035,8 @@ public final class HorizonClient {
             var colors = net.minecraft.client.color.block.BlockColors.createDefault();
             set(Minecraft.class, minecraft, "blockColors", colors);
             var atlases = new net.minecraft.client.resources.model.sprite.AtlasManager(minecraft.getTextureManager(), 0);
-            var skins = (net.minecraft.client.renderer.PlayerSkinRenderCache) Natives.allocate(net.minecraft.client.renderer.PlayerSkinRenderCache.class);
+            var skins = new net.minecraft.client.renderer.PlayerSkinRenderCache(
+                    minecraft.getTextureManager(), minecraft.getSkinManager(), minecraft.services().profileResolver());
             // Minecraft's constructor makes its model manager at once, its models filled by the
             // reload: mods' client start reads it (TACZ's item renderers keep
             // getEntityModels(), a supplier over it). Loaded or not: modelsLoaded(). The one the
@@ -1929,6 +2089,9 @@ public final class HorizonClient {
             // It runs on while the server ticks (finishModels each client tick): one that
             // waits for something it never gets (the 107-jar pack's) mustn't hold the server.
             pendingModels = new Object[] {reload, models, atlases, started, skins};
+            // Vanilla constructs this dispatcher before its asynchronous reload completes.
+            // Screens may render entity previews while models are still loading.
+            featureRenderer(models, atlases);
         } catch (Throwable t) {
             Throwable root = t;
             while (root.getCause() != null && root.getCause() != root) root = root.getCause();
@@ -2203,13 +2366,13 @@ public final class HorizonClient {
                 set(owner, gameRenderer, "fogRenderer", fog);
                 com.mojang.blaze3d.systems.RenderSystem.setShaderFog(fog.getBuffer(net.minecraft.client.renderer.fog.FogRenderer.FogMode.NONE));
             },
-            () -> set(owner, gameRenderer, "mainRenderTarget", new com.mojang.blaze3d.pipeline.TextureTarget("main", width * 3, height * 3,
+            () -> set(owner, gameRenderer, "mainRenderTarget", new com.mojang.blaze3d.pipeline.TextureTarget("main", minecraft.getWindow().getWidth(), minecraft.getWindow().getHeight(),
                     com.mojang.renderpearl.api.GpuFormat.RGBA8_UNORM, com.mojang.renderpearl.api.GpuFormat.D32_FLOAT)),
             // The Globals uniform (GameRenderer.render updates it each frame): pipelines on the
             // GLOBALS layout (item_cutout: Iceberg's 3D item) skipped their draws without it.
             () -> {
                 var globals = new net.minecraft.client.renderer.GlobalSettingsUniform();
-                globals.update(width * 3, height * 3, 1.0, 0L, 0.0F, 0, net.minecraft.world.phys.Vec3.ZERO, false);
+                globals.update(minecraft.getWindow().getWidth(), minecraft.getWindow().getHeight(), 1.0, 0L, 0.0F, 0, net.minecraft.world.phys.Vec3.ZERO, false);
                 set(owner, gameRenderer, "globalSettingsUniform", globals);
             },
         };
@@ -2267,6 +2430,7 @@ public final class HorizonClient {
                 }
                 // This game's own client (connected to another's server): that server.
                 HorizonDeviceClient.ownConnection(copy);
+                HorizonHooks.initFields(copy);
                 return copy;
             } catch (Throwable t) {
                 Natives.log("Horizon's client: no connection of its own for " + player.getName().getString() + ": " + t);
@@ -2490,7 +2654,7 @@ public final class HorizonClient {
      * The client's thread is the render thread (RenderSystem.assertOnRenderThread): the
      * headless client runs on the thread that ticks it (the server's).
      */
-    private static void renderThread() {
+    static void renderThread() {
         if (com.mojang.blaze3d.systems.RenderSystem.isOnRenderThread()) return;
         try {
             set(com.mojang.blaze3d.systems.RenderSystem.class, null, "renderThread", Thread.currentThread());
@@ -2523,8 +2687,11 @@ public final class HorizonClient {
             packs.addAll(net.fabricmc.fabric.impl.resource.pack.ModPackResourcesUtil.getModResourcePacks(
                     net.fabricmc.loader.api.FabricLoader.getInstance(), type, null));
             var loader = net.fabricmc.fabric.impl.resource.ResourceLoaderImpl.get(type);
-            listeners = ((java.util.Map<Object, net.minecraft.server.packs.resources.PreparableReloadListener>)
-                    field(net.fabricmc.fabric.impl.resource.ResourceLoaderImpl.class, loader, "addedReloaders")).values();
+            listeners = new java.util.ArrayList<>(((java.util.Map<Object, net.minecraft.server.packs.resources.PreparableReloadListener>)
+                    field(net.fabricmc.fabric.impl.resource.ResourceLoaderImpl.class, loader, "addedReloaders")).values());
+            listeners.addAll((java.util.List<net.minecraft.server.packs.resources.PreparableReloadListener>)
+                    field(net.minecraft.server.packs.resources.ReloadableResourceManager.class,
+                            minecraft.getResourceManager(), "listeners"));
         } catch (Throwable t) {
             Natives.log("Horizon's client: the mods' resources could not be loaded: " + t);
             return;
@@ -2558,9 +2725,8 @@ public final class HorizonClient {
         // The client's resource manager (Minecraft.getResourceManager: Xaero reads its radar
         // icons' definitions there), over the same packs.
         try {
-            var reloadable = new net.minecraft.server.packs.resources.ReloadableResourceManager(type);
+            var reloadable = minecraft.getResourceManager();
             set(net.minecraft.server.packs.resources.ReloadableResourceManager.class, reloadable, "resources", manager);
-            set(Minecraft.class, minecraft, "resourceManager", reloadable);
         } catch (Throwable t) {
             Natives.log("Horizon's client: no client resource manager: " + t);
         }
@@ -2712,6 +2878,16 @@ public final class HorizonClient {
     }
 
     static void tickOnce() {
+        // Gui.tick normally advances this clock. Mods cache held-item and health bar
+        // calculations by it, so a headless HUD needs a fresh tick before extraction.
+        var hud = minecraft.gui.hud;
+        try {
+            set(net.minecraft.client.gui.Hud.class, hud, "tickCount", hud.getGuiTicks() + 1);
+        } catch (ReflectiveOperationException e) {
+            if (HUD_FAILURES.putIfAbsent("clock", 1) == null) {
+                Natives.log("Horizon's client: the HUD clock couldn't advance: " + e);
+            }
+        }
         HorizonHooks.fireClient(minecraft, "runTick");
         HorizonHooks.fireClient(minecraft, "tick");
         // Minecraft.handleKeybinds' attack each tick (continueAttack: the attack key held with
@@ -3151,11 +3327,10 @@ public final class HorizonClient {
                 // Its chunk source (mods ask it for the light engine: Xaero's World Map), its
                 // light Horizon's as the level's own (LevelMixin).
                 try {
-                    var cache = new net.minecraft.client.multiplayer.ClientChunkCache(level, 12);
-                    set(net.minecraft.client.multiplayer.ClientChunkCache.class, cache, "lightEngine", HorizonServer.light(level));
-                    set(owner, level, "chunkSource", cache);
+                    set(owner, level, "chunkSource", mirrorChunkCache(level));
                 } catch (Throwable t) {
                     Natives.log("Horizon's client: a client level has no chunk source: " + t);
+                    for (var frame : t.getStackTrace()) Natives.log("    at " + frame);
                 }
                 // Its biomes (biome tints: grass, foliage, water), from its chunks (Horizon's),
                 // zoomed with the world's seed as a client's are.
@@ -3175,6 +3350,23 @@ public final class HorizonClient {
             }
             return level;
         });
+    }
+
+    /** The vanilla cache shell over Horizon's chunks and light, without a second light engine. */
+    private static net.minecraft.client.multiplayer.ClientChunkCache mirrorChunkCache(
+            net.minecraft.client.multiplayer.ClientLevel level) throws ReflectiveOperationException {
+        var owner = net.minecraft.client.multiplayer.ClientChunkCache.class;
+        var cache = owner.cast(Natives.allocate(owner));
+        var biome = level.registryAccess().lookupOrThrow(net.minecraft.core.registries.Registries.BIOME)
+                .getOrThrow(net.minecraft.world.level.biome.Biomes.PLAINS);
+        var empty = new net.minecraft.world.level.chunk.EmptyLevelChunk(level, new net.minecraft.world.level.ChunkPos(0, 0), biome);
+        var storage = owner.getDeclaredField("storage").getType().getDeclaredConstructor(owner, int.class);
+        storage.setAccessible(true);
+        set(owner, cache, "level", level);
+        set(owner, cache, "emptyChunk", empty);
+        set(owner, cache, "storage", storage.newInstance(cache, LOGIN_RADIUS + 3));
+        set(owner, cache, "lightEngine", HorizonServer.light(level));
+        return cache;
     }
 
     /** A client level's entities (ClientLevelMixin): its mirrored level's. */
@@ -3266,16 +3458,68 @@ public final class HorizonClient {
     private static final java.util.Map<String, Integer> HUD_FAILURES = new java.util.concurrent.ConcurrentHashMap<>();
     /** The last HUD sent to each player. */
     private static final java.util.Map<java.util.UUID, String> HUD_SENT = new java.util.concurrent.ConcurrentHashMap<>();
+    private record HudLook(float yaw, float pitch) {}
+    private record HudDraw(long time, HudLook look) {}
+    private static final java.util.Map<java.util.UUID, HudDraw> HUD_DRAWN = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.Map<java.util.UUID, HudLook> HUD_LOOK = new java.util.concurrent.ConcurrentHashMap<>();
     /** Hud's parts under extractPlayerHealth (the hearts, food, armour, air: AppleSkin's). */
     private static final java.util.Set<String> HEALTH_PARTS = java.util.Set.of(
             "extractPlayerHealth", "extractHearts", "extractHeart", "extractFood", "extractArmor", "extractAirBubbles");
 
     /** The player's HUD as their client's mods draw it, to them when it changed. */
     private static void sendHud(net.minecraft.server.level.ServerPlayer player) {
-        String frame = hud(player).toString();
-        if (frame.equals(HUD_SENT.get(player.getUUID()))) return;
-        HUD_SENT.put(player.getUUID(), frame);
-        Natives.hudFrame(player.getUUID().toString(), frame);
+        var id = player.getUUID();
+        var look = HUD_LOOK.get(id);
+        HUD_DRAWN.put(id, new HudDraw(System.nanoTime(), look));
+        var local = minecraft.player;
+        String frame;
+        if (look == null || local == null || !id.equals(local.getUUID())) {
+            frame = hud(player).toString();
+        } else {
+            float yaw = local.getYRot(), pitch = local.getXRot();
+            float previousYaw = local.yRotO, previousPitch = local.xRotO;
+            try {
+                // HUDs follow the rendered look even between world ticks.
+                local.setYRot(look.yaw());
+                local.setXRot(look.pitch());
+                local.yRotO = look.yaw();
+                local.xRotO = look.pitch();
+                frame = hud(player).toString();
+            } finally {
+                local.setYRot(yaw);
+                local.setXRot(pitch);
+                local.yRotO = previousYaw;
+                local.xRotO = previousPitch;
+            }
+        }
+        if (frame.equals(HUD_SENT.get(id))) return;
+        HUD_SENT.put(id, frame);
+        Natives.hudFrame(id.toString(), frame);
+    }
+
+    static void clientHudFrame(net.minecraft.server.level.ServerPlayer player, float yaw, float pitch) {
+        var id = player.getUUID();
+        var look = HUD_LOOK.compute(id, (key, old) -> old != null && old.yaw() == yaw && old.pitch() == pitch
+                ? old : new HudLook(yaw, pitch));
+        var last = HUD_DRAWN.get(id);
+        // The regular client tick already refreshes stationary overlays.
+        if (last == null || look.equals(last.look()) || System.nanoTime() - last.time() < 8_000_000L
+                || pendingModels != null) return;
+        try {
+            inWorld(player, () -> {
+                HorizonHooks.fireFrame(minecraft.gameRenderer, true);
+                try {
+                    sendHud(player);
+                } finally {
+                    HorizonHooks.fireFrame(minecraft.gameRenderer, false);
+                    HorizonHooks.fireRender(minecraft.gameRenderer);
+                    HorizonGpu.endFrame();
+                }
+            });
+        } catch (Throwable t) {
+            HUD_DRAWN.remove(id);
+            HorizonFailures.report("drawing the client HUD", t);
+        }
     }
 
     /**
@@ -3293,6 +3537,7 @@ public final class HorizonClient {
         HorizonGraphics graphics = new HorizonGraphics(width, height);
         graphics.modsOnly = true;
         graphics.imagesSent = imagesSent(id);
+        graphics.hudFrame = id.equals(HorizonDeviceMods.own);
         var delta = net.minecraft.client.DeltaTracker.ONE;
         fabricHudElements(graphics, delta);
         // The end of the in-game GUI's frame: the mods' overlays there (MaLiLib's: MiniHUD).
@@ -3309,24 +3554,32 @@ public final class HorizonClient {
         var hooked = HorizonHooks.hudMethods();
         // Hearts and food show where the player can be hurt (Hud.extractHotbarAndDecorations).
         if (hurtable && !java.util.Collections.disjoint(hooked, HEALTH_PARTS)) {
-            hudPart("extractPlayerHealth", () -> call(hud, "extractPlayerHealth", graphics));
+            hudPart("extractPlayerHealth", () -> extractHudPart(hud, "extractPlayerHealth", graphics, delta));
         }
-        for (String method : hooked) {
-            if (HEALTH_PARTS.contains(method) || method.equals("extractRenderState")) continue;
-            hudPart(method, () -> {
-                for (var m : net.minecraft.client.gui.Hud.class.getDeclaredMethods()) {
-                    if (!m.getName().equals(method) || m.isSynthetic()) continue;
-                    Class<?>[] params = m.getParameterTypes();
-                    if (params.length == 1 && params[0] == net.minecraft.client.gui.GuiGraphicsExtractor.class) {
-                        m.setAccessible(true);
-                        m.invoke(hud, graphics);
-                    } else if (params.length == 2 && params[0] == net.minecraft.client.gui.GuiGraphicsExtractor.class
-                            && params[1] == net.minecraft.client.DeltaTracker.class) {
-                        m.setAccessible(true);
-                        m.invoke(hud, graphics, delta);
-                    }
+        if (hooked.contains("extractItemHotbar") || hooked.contains("extractSlot")) {
+            hudPart("extractItemHotbar", () -> {
+                // A mod can move the frame, items and counts together. Record the
+                // complete layer and publish it only after extraction succeeds.
+                var hotbar = new HorizonGraphics(width, height);
+                hotbar.imagesSent = graphics.imagesSent;
+                extractHudPart(hud, "extractItemHotbar", hotbar, delta);
+                var ops = hotbar.ops();
+                if (!ops.isEmpty()) {
+                    var layer = new com.google.gson.JsonObject();
+                    layer.addProperty("op", "hotbar_layer");
+                    layer.addProperty("width", width);
+                    layer.addProperty("height", height);
+                    layer.addProperty("selected", minecraft.player.getInventory().getSelectedSlot());
+                    layer.add("ops", ops);
+                    graphics.ops().add(layer);
                 }
             });
+        }
+        for (String method : hooked) {
+            if (HEALTH_PARTS.contains(method) || method.equals("extractRenderState")
+                    || method.equals("extractItemHotbar") || method.equals("extractSlot")
+                    || method.equals("extractHotbarAndDecorations")) continue;
+            hudPart(method, () -> extractHudPart(hud, method, graphics, delta));
         }
         if (hooked.contains("extractRenderState")) {
             hudPart("extractRenderState", () -> HorizonHooks.fireHud(hud, "extractRenderState", graphics, delta));
@@ -3349,13 +3602,28 @@ public final class HorizonClient {
         return graphics.ops();
     }
 
-    private static void call(Object target, String name, Object... args) throws Throwable {
-        for (var m : target.getClass().getDeclaredMethods()) {
-            if (m.getName().equals(name) && m.getParameterCount() == args.length) {
-                m.setAccessible(true);
-                m.invoke(target, args);
-                return;
+    private static final class HudExtractors {
+        static final java.util.Map<String, java.util.List<java.lang.reflect.Method>> METHODS = find();
+
+        private static java.util.Map<String, java.util.List<java.lang.reflect.Method>> find() {
+            var methods = new java.util.HashMap<String, java.util.List<java.lang.reflect.Method>>();
+            for (var method : net.minecraft.client.gui.Hud.class.getDeclaredMethods()) {
+                var params = method.getParameterTypes();
+                if (method.isSynthetic() || params.length < 1 || params.length > 2
+                        || params[0] != net.minecraft.client.gui.GuiGraphicsExtractor.class
+                        || (params.length == 2 && params[1] != net.minecraft.client.DeltaTracker.class)) continue;
+                method.setAccessible(true);
+                methods.computeIfAbsent(method.getName(), ignored -> new java.util.ArrayList<>()).add(method);
             }
+            return methods;
+        }
+    }
+
+    private static void extractHudPart(Object hud, String name, HorizonGraphics graphics,
+                                       net.minecraft.client.DeltaTracker delta) throws ReflectiveOperationException {
+        for (var method : HudExtractors.METHODS.getOrDefault(name, java.util.List.of())) {
+            if (method.getParameterCount() == 1) method.invoke(hud, graphics);
+            else method.invoke(hud, graphics, delta);
         }
     }
 
@@ -3458,7 +3726,7 @@ public final class HorizonClient {
     public static String frame(java.util.UUID player, int mouseX, int mouseY) {
         var screen = SCREENS.get(player);
         if (screen == null) return null;
-        HorizonGraphics graphics = new HorizonGraphics(width, height);
+        HorizonGraphics graphics = new HorizonGraphics(width, height, mouseX, mouseY);
         graphics.imagesSent = imagesSent(player);
         try {
             as(OWNERS.get(player), () -> {
@@ -3637,7 +3905,7 @@ public final class HorizonClient {
         var player = HorizonServer.player(id);
         if (screen == null || player == null) return null;
         double[] mouse = OVERLAY_MOUSE.getOrDefault(id, new double[] {-1, -1});
-        HorizonGraphics graphics = new HorizonGraphics(width, height);
+        HorizonGraphics graphics = new HorizonGraphics(width, height, (int) mouse[0], (int) mouse[1]);
         graphics.modsOnly = true;
         graphics.imagesSent = imagesSent(id);
         try {
@@ -3689,6 +3957,9 @@ public final class HorizonClient {
                         windowSize();
                     }
                     if (OVERLAYS.containsKey(id)) return;
+                    if (in.has("x") && in.has("y")) {
+                        OVERLAY_MOUSE.put(id, new double[]{in.get("x").getAsDouble(), in.get("y").getAsDouble()});
+                    }
                     as(player, () -> {
                         var screen = new HorizonOverlayScreen(player.inventoryMenu, player.getInventory());
                         OVERLAYS.put(id, screen);
@@ -3701,6 +3972,8 @@ public final class HorizonClient {
                 case "close" -> {
                     var screen = OVERLAYS.remove(id);
                     OVERLAY_SENT.remove(id);
+                    OVERLAY_MOUSE.remove(id);
+                    DRAWN.remove(id);
                     if (screen != null) as(player, () -> HorizonScreenEvents.removed(screen));
                     // An empty frame: nothing left over the next inventory before it draws.
                     Natives.overlayFrame(id.toString(), "[]");
@@ -3800,21 +4073,29 @@ public final class HorizonClient {
     }
 
     private static java.lang.reflect.Method runAllTasks;
+    private static java.lang.reflect.Method pollTask;
 
     /**
      * The client's thread is the server thread (where Horizon runs every screen and message):
      * what is handed to it there runs at once, and what other threads hand it runs here, each
      * tick, as the client's frame would run it.
      */
+    private static final java.util.Set<String> TASK_ERRORS = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
     static void tasks() {
         try {
-            if (minecraft.getRunningThread() == null) {
+            if (minecraft.getRunningThread() != Thread.currentThread()) {
+                HorizonMixinInit.rebindThread(minecraft, minecraft.getRunningThread(), Thread.currentThread());
                 set(Minecraft.class, minecraft, "gameThread", Thread.currentThread());
             }
             // Its packet processor on that thread (mods' own packets' handlers check they run
             // there: PacketUtils.ensureRunningOnSameThread), the packets queued from others run here.
             if (minecraft.packetProcessor() == null) {
                 set(Minecraft.class, minecraft, "packetProcessor", new net.minecraft.network.PacketProcessor(minecraft.getRunningThread()));
+            } else if (!minecraft.packetProcessor().isSameThread()) {
+                // Keep packets queued during loading when the client moves to its tick thread.
+                set(net.minecraft.network.PacketProcessor.class, minecraft.packetProcessor(),
+                        "runningThread", Thread.currentThread());
             }
             minecraft.packetProcessor().processQueuedPackets();
             if (runAllTasks == null) {
@@ -3825,8 +4106,22 @@ public final class HorizonClient {
         } catch (Throwable t) {
             Throwable root = t;
             while (root.getCause() != null && root.getCause() != root) root = root.getCause();
-            Natives.log("Horizon's client: a client task failed: " + root);
+            if (TASK_ERRORS.add(root.toString())) {
+                Natives.log("Horizon's client: a client task failed: " + root);
+                for (var frame : root.getStackTrace()) Natives.log("    at " + frame);
+            }
             HorizonFailures.report("a client task", root);
+            // A mod's runAllTasks injection can fail before vanilla drains its queue.
+            // Keep unrelated reload/apply tasks moving through vanilla's individual runner.
+            try {
+                if (pollTask == null) {
+                    pollTask = net.minecraft.util.thread.BlockableEventLoop.class.getDeclaredMethod("pollTask");
+                    pollTask.setAccessible(true);
+                }
+                for (int n = 0; n < 10000 && Boolean.TRUE.equals(pollTask.invoke(minecraft)); n++) {}
+            } catch (Throwable fallback) {
+                if (TASK_ERRORS.add(fallback.toString())) Natives.log("Horizon's client: its task queue couldn't drain: " + fallback);
+            }
         }
     }
 

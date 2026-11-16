@@ -128,6 +128,8 @@ pub struct Extras {
     pub chat_animation: bool,
     /// The indicator bar at the left of a chat line (on by default, as vanilla).
     pub chat_indicator: bool,
+    /// Show player heads beside chat messages.
+    pub chat_heads: bool,
     /// No AI: every AI feature hidden and off (`horizon_core::no_ai`; the launcher writes it too).
     pub no_ai: bool,
     /// Agents may control the game the player starts: it opens its control socket for
@@ -211,6 +213,7 @@ impl Default for Extras {
             sort_key: "key.keyboard.unknown".into(),
             chat_animation: false,
             chat_indicator: true,
+            chat_heads: false,
             no_ai: false,
             agent_control: false,
             repro_keys: false,
@@ -311,6 +314,7 @@ impl Extras {
                 "sortKey" if value.starts_with("key.") => e.sort_key = value.to_owned(),
                 "chatAnimation" => e.chat_animation = flag(e.chat_animation),
                 "chatIndicator" => e.chat_indicator = flag(e.chat_indicator),
+                "chatHeads" => e.chat_heads = flag(e.chat_heads),
                 horizon_core::no_ai::KEY => e.no_ai = flag(e.no_ai),
                 "agentControl" => e.agent_control = flag(e.agent_control),
                 "reproKeys" => e.repro_keys = flag(e.repro_keys),
@@ -345,7 +349,7 @@ impl Extras {
     }
     pub fn serialize(&self) -> String {
         let mut text = format!(
-            "packBrowser:{}\nfullbright:{}\ndynamicLights:{}\nzoom:{}\nzoomKey:{}\nzoomLevel:{}\nzoomSmooth:{}\nzoomSensitivity:{}\nlodZoomDetail:{}\nfps:{}\nfpsCorner:{}\nfpsLows:{}\nkeystrokes:{}\nkeystrokesCorner:{}\nkeystrokesCps:{}\nmovedToMods:{}\nminimap:{}\nminimapCorner:{}\nminimapSize:{}\nminimapShape:{}\nminimapZoom:{}\nminimapRotate:{}\nautoReconnect:{}\nuiSoundReserve:{}\nownNameTag:{}\nhideBlockParticles:{}\nmouseTweaks:{}\nmouseTweaksWheel:{}\nsort:{}\nsortKey:{}\nchatAnimation:{}\nchatIndicator:{}\n{}:{}\nagentControl:{}\nreproKeys:{}\ndiscordPresence:{}\nsplitscreen:{}\nsplitscreenTwo:{}\nsplitscreenThree:{}\nsplitscreenNames:{}\nwheelCyclesSettings:{}\nmusicOff:{}\nmusicPage:{}\ncosmeticsMine:{}\n{}cosmeticsAuras:{}\n{}:{}\n",
+            "packBrowser:{}\nfullbright:{}\ndynamicLights:{}\nzoom:{}\nzoomKey:{}\nzoomLevel:{}\nzoomSmooth:{}\nzoomSensitivity:{}\nlodZoomDetail:{}\nfps:{}\nfpsCorner:{}\nfpsLows:{}\nkeystrokes:{}\nkeystrokesCorner:{}\nkeystrokesCps:{}\nmovedToMods:{}\nminimap:{}\nminimapCorner:{}\nminimapSize:{}\nminimapShape:{}\nminimapZoom:{}\nminimapRotate:{}\nautoReconnect:{}\nuiSoundReserve:{}\nownNameTag:{}\nhideBlockParticles:{}\nmouseTweaks:{}\nmouseTweaksWheel:{}\nsort:{}\nsortKey:{}\nchatAnimation:{}\nchatIndicator:{}\nchatHeads:{}\n{}:{}\nagentControl:{}\nreproKeys:{}\ndiscordPresence:{}\nsplitscreen:{}\nsplitscreenTwo:{}\nsplitscreenThree:{}\nsplitscreenNames:{}\nwheelCyclesSettings:{}\nmusicOff:{}\nmusicPage:{}\ncosmeticsMine:{}\n{}cosmeticsAuras:{}\n{}:{}\n",
             bool_text(self.pack_browser),
             bool_text(self.fullbright),
             bool_text(self.dynamic_lights),
@@ -382,6 +386,7 @@ impl Extras {
             self.sort_key,
             bool_text(self.chat_animation),
             bool_text(self.chat_indicator),
+            bool_text(self.chat_heads),
             horizon_core::no_ai::KEY,
             bool_text(self.no_ai),
             bool_text(self.agent_control),
@@ -558,6 +563,7 @@ pub enum Item {
     ChatAnimation,
     /// The coloured bar at the left of a chat line.
     ChatIndicator,
+    ChatHeads,
     /// Not on the Extras page: Horizon Settings shows No AI, its AI Agent page Agent Control.
     NoAi,
     AgentControl,
@@ -596,6 +602,7 @@ pub fn rows() -> Vec<Result<Item, &'static str>> {
         Err("horizon.extras.header.chat"),
         Ok(ChatAnimation),
         Ok(ChatIndicator),
+        Ok(ChatHeads),
         Err("horizon.extras.header.multiplayer"),
         Ok(AutoReconnect),
         Err("horizon.extras.header.sound"),
@@ -637,6 +644,7 @@ impl Item {
             Item::Splitscreen => "horizon.extras.splitscreen",
             Item::ChatAnimation => "horizon.extras.chat_animation",
             Item::ChatIndicator => "horizon.extras.chat_indicator",
+            Item::ChatHeads => "horizon.extras.chat_heads",
             Item::WheelCyclesSettings => "horizon.extras.wheel_cycles_settings",
             Item::PackBrowser => "horizon.extras.pack_browser",
             Item::CosmeticsMine => "horizon.extras.cosmetics_mine",
@@ -666,6 +674,7 @@ impl Item {
             Item::Splitscreen => "horizon.extras.splitscreen.tooltip",
             Item::ChatAnimation => "horizon.extras.chat_animation.tooltip",
             Item::ChatIndicator => "horizon.extras.chat_indicator.tooltip",
+            Item::ChatHeads => "horizon.extras.chat_heads.tooltip",
             Item::WheelCyclesSettings => "horizon.extras.wheel_cycles_settings.tooltip",
             Item::PackBrowser => "horizon.extras.pack_browser.tooltip",
             Item::CosmeticsMine => "horizon.extras.cosmetics_mine.tooltip",
@@ -699,6 +708,7 @@ impl Item {
             Item::SortKey => "Sort key",
             Item::ChatAnimation => "Smooth chat",
             Item::ChatIndicator => "Message indicator",
+            Item::ChatHeads => "Player heads in chat",
             Item::NoAi => "No AI",
             Item::AgentControl => "Agent Control",
             Item::ReproKeys => "Recording shortcuts",
@@ -723,8 +733,8 @@ impl Item {
             Pvp(o) => return o.parent().map(Pvp),
             Fullbright | DynamicLights | OwnNameTag | HideBlockParticles | MouseTweaks | Sort
             | AutoReconnect | NoAi | AgentControl | ReproKeys | DiscordPresence | Splitscreen
-            | ChatAnimation | WheelCyclesSettings | MusicPage | PackBrowser | CosmeticsMine
-            | CosmeticsOthers | CosmeticsAuras => {
+            | ChatAnimation | ChatHeads | WheelCyclesSettings | MusicPage | PackBrowser
+            | CosmeticsMine | CosmeticsOthers | CosmeticsAuras => {
                 return None;
             }
         })
@@ -767,6 +777,7 @@ impl Item {
                 "A new chat line slides in from the left while it fades in, instead of appearing whole."
             }
             Item::ChatIndicator => "The coloured bar at the left of a chat line.",
+            Item::ChatHeads => "Shows the player skin beside a chat message.",
             Item::NoAi => {
                 "Hides and turns off every AI feature: agent control, horizon-ctl and the MCP servers. The launcher's switch too."
             }
@@ -834,6 +845,7 @@ impl Item {
             Item::Sort => e.sort,
             Item::ChatAnimation => e.chat_animation,
             Item::ChatIndicator => e.chat_indicator,
+            Item::ChatHeads => e.chat_heads,
             Item::NoAi => e.no_ai,
             Item::AgentControl => e.agent_control,
             Item::ReproKeys => e.repro_keys,
@@ -889,6 +901,7 @@ impl Item {
             Item::Sort => e.sort = !e.sort,
             Item::ChatAnimation => e.chat_animation = !e.chat_animation,
             Item::ChatIndicator => e.chat_indicator = !e.chat_indicator,
+            Item::ChatHeads => e.chat_heads = !e.chat_heads,
             Item::NoAi => e.no_ai = !e.no_ai,
             Item::AgentControl => e.agent_control = !e.agent_control,
             Item::ReproKeys => e.repro_keys = !e.repro_keys,

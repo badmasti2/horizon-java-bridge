@@ -68,6 +68,13 @@ const PLATFORM_SRC: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/horizon-pl
 static BRIDGE: OnceLock<Bridge> = OnceLock::new();
 /// Held while a JVM is being made, so two threads never both try.
 static STARTING: Mutex<()> = Mutex::new(());
+/// Launcher session, handed directly to Java in memory before mod initialization.
+/// Never put this value in JVM arguments, environment variables, logs or diagnostics.
+static CLIENT_SESSION: Mutex<Option<(String, String, String, String)>> = Mutex::new(None);
+
+pub fn set_client_session(name: &str, uuid: &str, token: &str, xuid: &str) {
+    *CLIENT_SESSION.lock().unwrap() = Some((name.into(), uuid.into(), token.into(), xuid.into()));
+}
 /// Where `Natives.log` lines go instead of the game log (tests).
 static SINK: Mutex<Option<fn(&str)>> = Mutex::new(None);
 
@@ -910,6 +917,17 @@ fn start_fabric(
     fabric: &Fabric,
     add_mods: &[PathBuf],
 ) -> jni::errors::Result<Vec<String>> {
+    if fabric.side == Side::Client {
+        if let Some((name, uuid, token, xuid)) = CLIENT_SESSION.lock().unwrap().take() {
+            let name = env.new_string(name)?;
+            let uuid = env.new_string(uuid)?;
+            let token = env.new_string(token)?;
+            let xuid = env.new_string(xuid)?;
+            env.call_static_method("dev/horizonlab/bridge/fabric/FabricBoot", "setClientSession",
+                "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+                &[JValue::Object(&name), JValue::Object(&uuid), JValue::Object(&token), JValue::Object(&xuid)])?;
+        }
+    }
     let side = env.new_string(match fabric.side {
         Side::Client => "client",
         Side::Server => "server",

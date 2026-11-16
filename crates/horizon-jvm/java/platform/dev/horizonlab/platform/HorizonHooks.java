@@ -141,9 +141,8 @@ public final class HorizonHooks {
                 if (!h[0].equals(method) || !merged.mixin().equals(h[1])) continue;
                 if (!handlerNamed(m.getName(), h[2])) continue;
                 Class<?>[] params = m.getParameterTypes();
-                if (params.length != args.length + 1 || !CallbackInfo.class.isAssignableFrom(params[args.length])) continue;
-                Object[] call = java.util.Arrays.copyOf(args, args.length + 1);
-                call[args.length] = new CallbackInfo(method, true);
+                if (!callbackShape(params, args.length)) continue;
+                Object[] call = callbackArguments(m, args, new CallbackInfo(method, true));
                 try {
                     m.setAccessible(true);
                     m.invoke(Modifier.isStatic(m.getModifiers()) ? null : hud, call);
@@ -269,7 +268,7 @@ public final class HorizonHooks {
                 if (params[i] == boolean.class) call[i] = true;
                 else if (params[i] == float.class) call[i] = 1F;
                 else if (CallbackInfo.class.isAssignableFrom(params[i])) call[i] = new CallbackInfo("extractRenderState", true);
-                else if (params[i] == net.minecraft.client.DeltaTracker.class) call[i] = net.minecraft.client.DeltaTracker.ONE;
+                else if (params[i] == net.minecraft.client.DeltaTracker.class) call[i] = HorizonClient.deltaTracker();
                 else if (params[i].isInstance(graphics)) call[i] = graphics;
             }
             try {
@@ -410,7 +409,7 @@ public final class HorizonHooks {
             try {
                 Object self = Modifier.isStatic(handler.getModifiers()) ? null : gameRenderer;
                 if (at.equals(RENDER)) handler.invoke(self, new CallbackInfo("render", true));
-                else handler.invoke(self, net.minecraft.client.DeltaTracker.ONE, true, new CallbackInfo("extract", true));
+                else handler.invoke(self, HorizonClient.deltaTracker(), true, new CallbackInfo("extract", true));
             } catch (Throwable t) {
                 Throwable cause = t instanceof java.lang.reflect.InvocationTargetException ite && ite.getCause() != null ? ite.getCause() : t;
                 while (cause.getCause() != null && cause.getCause() != cause) cause = cause.getCause();
@@ -433,6 +432,8 @@ public final class HorizonHooks {
      * there (Trinkets Updated's), which register receivers of payloads its common init made.
      */
     public static final String START_OPTIONS = "<start at the options>";
+    public static final String START_FIXER = "<start at the data fixer>";
+    public static final String START_RESOURCES = "<start at resource registration>";
     /** Minecraft's constructor's end: after START_OPTIONS (FabricBoot runs both then). */
     public static final String START_END = "<start at its end>";
     /**
@@ -448,12 +449,17 @@ public final class HorizonHooks {
         if (ats.size() != 1 || !(ats.get(0) instanceof AnnotationNode node)) return null;
         // The constructor's end (MaLiLib's game-init-done: its mods register their renderers).
         if ("RETURN".equals(get(node, "value")) || "TAIL".equals(get(node, "value"))) return START_END;
+        String target = String.valueOf(get(node, "target"));
+        if ("FIELD".equals(get(node, "value"))
+                && target.equals("Lnet/minecraft/client/Minecraft;fixerUpper:Lcom/mojang/datafixers/DataFixer;")) return START_FIXER;
+        if ("INVOKE".equals(get(node, "value")) && target.equals(
+                "Lnet/minecraft/server/packs/resources/ReloadableResourceManager;registerReloadListener(Lnet/minecraft/server/packs/resources/PreparableReloadListener;)V")) return START_RESOURCES;
         if (!"INVOKE".equals(get(node, "value"))) return null;
         // The options' construction comes after the entrypoints (Yumi runs its mods' client
         // initializers there: Trinkets Updated's); the save folder's validator after them
         // (MaLiLib's pre-init: its config folder).
-        String target = String.valueOf(get(node, "target"));
         if (target.startsWith("Lnet/minecraft/client/Options;<init>(")
+                || target.equals("Lnet/minecraft/client/Minecraft;resizeGui()V")
                 || target.startsWith("Lnet/minecraft/world/level/storage/LevelStorageSource;parseValidator(")) return START_OPTIONS;
         // The first resource reload's start, late in the constructor (JEI registers its
         // CLIENT_STARTED listener there, which starts it in a world): before the client's first
@@ -524,7 +530,8 @@ public final class HorizonHooks {
                                         || (params.length == 1 && CallbackInfo.class.isAssignableFrom(params[0]))
                                 // The constructor's: its GameConfig may be taken (null here).
                                 : method.equals(START_AFTER) || method.equals(START_BEFORE) || method.equals(START_OPTIONS)
-                                        || method.equals(START_END) || method.equals(START_PACKS)
+                                        || method.equals(START_END) || method.equals(START_PACKS) || method.equals(START_FIXER)
+                                        || method.equals(START_RESOURCES)
                                         ? (params.length == 1 && CallbackInfo.class.isAssignableFrom(params[0]))
                                                 || (params.length == 2 && params[0] == net.minecraft.client.main.GameConfig.class
                                                         && CallbackInfo.class.isAssignableFrom(params[1]))
@@ -600,8 +607,8 @@ public final class HorizonHooks {
         for (MethodNode m : node.methods) {
             for (AnnotationNode a : annotations(m.invisibleAnnotations, m.visibleAnnotations)) {
                 if (!"Lorg/spongepowered/asm/mixin/injection/Inject;".equals(a.desc)) continue;
-                String at = eventPoint(get(a, "at"));
-                if (at == null) continue;
+                List<String> points = eventPoints(get(a, "at"));
+                if (points.isEmpty()) continue;
                 boolean cancellable = Boolean.TRUE.equals(get(a, "cancellable"));
                 Object methods = get(a, "method");
                 if (!(methods instanceof List<?> specs)) continue;
@@ -609,9 +616,11 @@ public final class HorizonHooks {
                     String[] nameDesc = parseSpec((String) spec);
                     if (constructorsOnly && !nameDesc[0].equals("<init>")) continue;
                     for (String owner : targets) {
-                        HOOKS.computeIfAbsent(owner + "." + nameDesc[0], k -> new ArrayList<>())
-                                .add(new Hook(mod, owner, nameDesc[0], nameDesc[1], at, mixin, m.name, cancellable));
-                        n++;
+                        for (String at : points) {
+                            HOOKS.computeIfAbsent(owner + "." + nameDesc[0], k -> new ArrayList<>())
+                                    .add(new Hook(mod, owner, nameDesc[0], nameDesc[1], at, mixin, m.name, cancellable));
+                            n++;
+                        }
                     }
                 }
             }
@@ -634,18 +643,17 @@ public final class HorizonHooks {
         return null;
     }
 
-    /** HEAD, TAIL or RETURN when every @At of the injection is one of them; else null. */
-    private static String eventPoint(Object at) {
+    /** Distinct event points when every @At is HEAD, TAIL or RETURN; otherwise none. */
+    private static List<String> eventPoints(Object at) {
         List<?> ats = at instanceof List<?> l ? l : at == null ? List.of() : List.of(at);
-        String point = null;
+        List<String> points = new ArrayList<>();
         for (Object o : ats) {
-            if (!(o instanceof AnnotationNode node)) return null;
+            if (!(o instanceof AnnotationNode node)) return List.of();
             Object v = get(node, "value");
-            if (!"HEAD".equals(v) && !"TAIL".equals(v) && !"RETURN".equals(v)) return null;
-            if (point != null && !point.equals(v)) return null;
-            point = (String) v;
+            if (!"HEAD".equals(v) && !"TAIL".equals(v) && !"RETURN".equals(v)) return List.of();
+            if (!points.contains(v)) points.add((String) v);
         }
-        return point;
+        return points;
     }
 
     /** "INVOKE target" for an injection at one INVOKE @At; else null. */
@@ -897,10 +905,15 @@ public final class HorizonHooks {
                 for (MethodNode m : node.methods) {
                     for (AnnotationNode a : annotations(m.invisibleAnnotations, m.visibleAnnotations)) {
                         if (!"Lorg/spongepowered/asm/mixin/injection/Inject;".equals(a.desc)) continue;
-                        String point = eventPoint(get(a, "at"));
-                        if (point == null) point = invokePoint(get(a, "at"));
-                        if (point == null || !(get(a, "method") instanceof List<?> specs)) continue;
-                        for (Object spec : specs) out.add(new String[] {parseSpec((String) spec)[0], m.name, point});
+                        List<String> points = eventPoints(get(a, "at"));
+                        if (points.isEmpty()) {
+                            String invoke = invokePoint(get(a, "at"));
+                            if (invoke != null) points = List.of(invoke);
+                        }
+                        if (points.isEmpty() || !(get(a, "method") instanceof List<?> specs)) continue;
+                        for (Object spec : specs) {
+                            for (String point : points) out.add(new String[] {parseSpec((String) spec)[0], m.name, point});
+                        }
                     }
                 }
             } catch (Throwable t) {
@@ -1050,9 +1063,7 @@ public final class HorizonHooks {
                 ? new CallbackInfo(method, true)
                 : new CallbackInfoReturnable<>(method, true, returnValue);
         for (Method handler : handlers) {
-            Object[] call = new Object[args.length + 1];
-            System.arraycopy(args, 0, call, 0, args.length);
-            call[args.length] = info;
+            Object[] call = callbackArguments(handler, args, info);
             try {
                 handler.invoke(Modifier.isStatic(handler.getModifiers()) ? null : self, call);
             } catch (Throwable t) {
@@ -1126,12 +1137,14 @@ public final class HorizonHooks {
      * the target's constructors, which the mirror's objects skip.
      */
     private static final Map<String, List<String[]>> FIELD_INITS = new HashMap<>();
+    private static final java.util.Set<String> FIELD_SCANNED = ConcurrentHashMap.newKeySet();
     /** The mods' @WrapOperation handlers on calls in constructors, by target class: (mixin, handler, wrapped call). */
     private static final Map<String, List<String[]>> CONSTRUCTOR_WRAPS = new HashMap<>();
 
     private static void readFieldInits(byte[] bytes) {
         ClassNode node = new ClassNode();
         new ClassReader(bytes).accept(node, ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+        if (!FIELD_SCANNED.add(node.name)) return;
         List<String> targets = new ArrayList<>();
         for (AnnotationNode a : annotations(node.invisibleAnnotations, node.visibleAnnotations)) {
             if (!"Lorg/spongepowered/asm/mixin/Mixin;".equals(a.desc)) continue;
@@ -1209,6 +1222,18 @@ public final class HorizonHooks {
     public static void initFields(Object self) {
         scan();
         for (Class<?> c = self.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
+            // Plugins can register mixins outside fabric.mod.json's lists. Their merged
+            // methods still identify the original class carrying constructor initializers.
+            for (Method method : c.getDeclaredMethods()) {
+                var merged = method.getAnnotation(MixinMerged.class);
+                if (merged == null || FIELD_SCANNED.contains(merged.mixin().replace('.', '/'))) continue;
+                try (var in = c.getClassLoader().getResourceAsStream(merged.mixin().replace('.', '/') + ".class")) {
+                    if (in != null) readFieldInits(in.readAllBytes());
+                    else if (DEBUG) Natives.log("Mixin fields: unavailable resource " + merged.mixin());
+                } catch (java.io.IOException e) {
+                    if (DEBUG) Natives.log("Mixin fields: " + merged.mixin() + ": " + e);
+                }
+            }
             // The mixins' initializers themselves, where their code can be copied.
             HorizonMixinInit.run(self, c);
             List<String[]> inits = FIELD_INITS.get(c.getName().replace('.', '/'));
@@ -1498,6 +1523,23 @@ public final class HorizonHooks {
         });
     }
 
+    /**
+     * Mixin permits either all target arguments before CallbackInfo, or CallbackInfo alone.
+     * Locals after the callback require a vanilla frame and cannot be supplied here.
+     */
+    private static boolean callbackShape(Class<?>[] params, int arguments) {
+        return (params.length == 1 || params.length == arguments + 1)
+                && CallbackInfo.class.isAssignableFrom(params[params.length - 1]);
+    }
+
+    private static Object[] callbackArguments(Method handler, Object[] args, CallbackInfo info) {
+        int count = handler.getParameterCount();
+        Object[] call = new Object[count];
+        if (count > 1) System.arraycopy(args, 0, call, 0, count - 1);
+        call[count - 1] = info;
+        return call;
+    }
+
     /** The merged handlers of these hooks in the target class, priority first, for one call shape. */
     private static List<Method> resolve(Class<?> owner, List<Hook> hooks, String method, String desc, String at,
                                         int arguments, boolean skipFabric) {
@@ -1518,9 +1560,7 @@ public final class HorizonHooks {
                 if (!merged.mixin().equals(h.mixin())) continue;
                 if (!handlerNamed(m.getName(), h.handler())) continue;
                 Class<?>[] params = m.getParameterTypes();
-                // The method's arguments, then the CallbackInfo; locals captured after it can't
-                // be given (no vanilla frame runs), so such a handler is left out.
-                if (params.length != arguments + 1 || !CallbackInfo.class.isAssignableFrom(params[arguments])) {
+                if (!callbackShape(params, arguments)) {
                     if (FAILURES.merge("shape " + m, 1, Integer::sum) == 1) {
                         Natives.log("Mixin census: " + h.mod() + "'s " + h.handler() + " at " + at + " of "
                                 + owner.getSimpleName() + "." + method + " takes locals; Horizon can't give them");

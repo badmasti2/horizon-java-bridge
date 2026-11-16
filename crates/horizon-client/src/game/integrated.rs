@@ -52,6 +52,11 @@ const PLAYER_CHUNKS: usize = 49;
 struct Flags {
     /// `Minecraft.pause`: a single-player pause screen is open.
     paused: AtomicBool,
+    /// The server has finished its last gameplay tick and the pause save.
+    #[cfg(feature = "java-mods")]
+    pause_applied: AtomicBool,
+    #[cfg(feature = "java-mods")]
+    hud_look: Mutex<Option<[f32; 2]>>,
     stop: AtomicBool,
     failure: Mutex<Option<String>>,
     /// `IntegratedServer.getPort`: the port it is open to the LAN on, 0
@@ -139,6 +144,18 @@ impl Integrated {
     pub fn set_paused(&self, paused: bool) {
         let split = !self.flags.split_players.lock().unwrap().is_empty();
         self.flags.paused.store(paused && !split, Ordering::Relaxed);
+    }
+    #[cfg(feature = "java-mods")]
+    pub(super) fn pause_applied(&self) -> bool {
+        self.flags.pause_applied.load(Ordering::Acquire)
+    }
+    #[cfg(feature = "java-mods")]
+    pub(super) fn set_hud_look(&self, look: [f32; 2]) {
+        *self
+            .flags
+            .hud_look
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(look);
     }
     /// Splitscreen: `name` left; the game pauses again once every such player has. The owner's
     /// permissions it was given go with it (a LAN player could otherwise join under that name).
@@ -281,6 +298,15 @@ struct LoadPhase {
     done: bool,
 }
 impl Serving {
+    #[cfg(feature = "java-mods")]
+    pub(super) fn hud_look(&self) -> Option<[f32; 2]> {
+        *self
+            .flags
+            .hud_look
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     /// The window reads this as `MinecraftServer.isCurrentlySaving`.
     pub(super) fn set_saving(&self, saving: bool) {
         self.flags.saving.store(saving, Ordering::Relaxed);
@@ -669,6 +695,8 @@ impl Game<'_> {
                 self.save_game_with(false)?;
             }
             was_paused = paused;
+            #[cfg(feature = "java-mods")]
+            flags.pause_applied.store(paused, Ordering::Release);
             if paused {
                 // Only the connections run.
                 self.tick_server_timed(true)?;

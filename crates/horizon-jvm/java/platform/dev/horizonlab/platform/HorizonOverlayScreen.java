@@ -23,6 +23,10 @@ final class HorizonOverlayScreen extends AbstractContainerScreen<InventoryMenu> 
     @Override
     protected void extractLabels(GuiGraphicsExtractor graphics, int mouseX, int mouseY) {}
 
+    // This screen supplies hover targets and mod overlays. Horizon already paints every slot.
+    @Override
+    protected void extractSlot(GuiGraphicsExtractor graphics, net.minecraft.world.inventory.Slot slot, int mouseX, int mouseY) {}
+
     @Override
     public void containerTick() {}
 

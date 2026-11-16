@@ -20,7 +20,10 @@ public abstract class TextureManagerMixin {
 
     @Inject(method = "getTexture", at = @At("HEAD"), cancellable = true)
     private void horizon$texture(Identifier id, CallbackInfoReturnable<AbstractTexture> cir) {
-        if (HorizonClient.headless()) cir.setReturnValue(HorizonTextures.get(id));
+        if (HorizonClient.headless()) {
+            AbstractTexture registered = byPath == null ? null : byPath.get(id);
+            cir.setReturnValue(registered != null ? registered : HorizonTextures.get(id));
+        }
     }
 
     /** A mod's own texture under a name (a dynamic one, drawn into memory): kept by name. */

@@ -3,6 +3,7 @@
   "id": "horizon",
   "version": "0.1.0",
   "name": "Horizon",
+  "icon": "horizon-icon.png",
   "description": "Horizon's side of the Java mod bridge: mirrors Horizon's server into vanilla objects and fires Fabric API's events.",
   "license": "MIT",
   "environment": "*",

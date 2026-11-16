@@ -16,15 +16,21 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  */
 @Mixin(Minecraft.class)
 public abstract class MinecraftCameraMixin {
+    /** Horizon owns the visible window; the Java mirror has no SDL window to rename. */
+    @Inject(method = "updateTitle", at = @At("HEAD"), cancellable = true)
+    private void horizon$windowTitle(CallbackInfo ci) {
+        if (HorizonClient.headless()) ci.cancel();
+    }
+
     @Inject(method = "getCameraEntity", at = @At("HEAD"), cancellable = true)
     private void horizon$camera(CallbackInfoReturnable<Entity> cir) {
         if (HorizonClient.headless()) cir.setReturnValue(((Minecraft) (Object) this).player);
     }
 
-    /** No frames, so no partial ticks: whole ticks (DeltaTracker.ONE). */
+    /** Whole ticks, using the real timer type so mods' timer accessors remain valid. */
     @Inject(method = "getDeltaTracker", at = @At("HEAD"), cancellable = true)
     private void horizon$deltaTracker(CallbackInfoReturnable<DeltaTracker> cir) {
-        if (HorizonClient.headless()) cir.setReturnValue(DeltaTracker.ONE);
+        if (HorizonClient.headless()) cir.setReturnValue(HorizonClient.deltaTracker());
     }
 
     /**

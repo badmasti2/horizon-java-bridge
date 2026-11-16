@@ -251,7 +251,8 @@ public final class HorizonPacketTap {
         if (play != null) HorizonClient.set(ClientCommonPacketListenerImpl.class, play, "connection", c);
         Natives.log("Horizon's client: " + player.getName().getString() + "'s client connection reads its packets");
         // What they get here, once a session: recordings, and where to watch them.
-        if (!told) {
+        var loader = net.fabricmc.loader.api.FabricLoader.getInstance();
+        if (!told && (loader.isModLoaded("replaymod") || loader.isModLoaded("flashback"))) {
             told = true;
             HorizonFailures.note(player.getStringUUID(), "Your client's packets go to " + (readers.isEmpty() ? "a mod" : readers)
                     + " (recordings save as the world closes). Horizon plays ReplayMod's .mcpr recordings: "
@@ -303,6 +304,14 @@ public final class HorizonPacketTap {
         if (DEBUG) Natives.log("tap: " + name + " " + packet.getClass().getSimpleName());
         if (!FIRED_ELSEWHERE.contains(name)) fire(real, name, type, packet, "HEAD");
         try {
+            if (packet instanceof net.minecraft.network.protocol.game.ClientboundCommandsPacket commands
+                    && real instanceof ClientPacketListener listener) {
+                var context = net.minecraft.commands.CommandBuildContext.simple(listener.registryAccess(), listener.enabledFeatures());
+                var builder = (net.minecraft.network.protocol.game.ClientboundCommandsPacket.NodeBuilder)
+                        HorizonClient.field(ClientPacketListener.class, null, "COMMAND_NODE_BUILDER");
+                HorizonClient.set(ClientPacketListener.class, listener, "commands",
+                        new com.mojang.brigadier.CommandDispatcher<>(commands.getRoot(context, builder)));
+            }
             // A bundle's packets, each to the listener as ClientPacketListener.handleBundlePacket does.
             if (packet instanceof BundlePacket<?> bundle) {
                 for (var sub : bundle.subPackets()) {

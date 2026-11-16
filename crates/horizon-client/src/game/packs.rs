@@ -30,6 +30,13 @@ pub fn packs_dir() -> PathBuf {
         .unwrap_or_default()
         .join("resourcepacks")
 }
+
+fn discover(vanilla: &Path) -> Vec<Pack> {
+    let mut packs = packs::discover(vanilla, &packs_dir());
+    #[cfg(feature = "java-mods")]
+    packs.extend(packs::embedded(&super::java_mods::mod_jars().1));
+    packs
+}
 /// `Util.getPlatform().openPath`: the system file manager on the folder.
 pub fn open_folder(dir: &Path) {
     let program = if cfg!(target_os = "windows") {
@@ -62,7 +69,7 @@ pub fn startup_root(
     selected: &[String],
     server: &[Pack],
 ) -> std::io::Result<PathBuf> {
-    let all = packs::discover(vanilla, &packs_dir());
+    let all = discover(vanilla);
     let mut enabled = packs::enabled(&all, selected);
     enabled.extend_from_slice(server);
     packs::resource_root(vanilla, &enabled, &cache_dir())
@@ -132,10 +139,7 @@ fn vanilla_info(vanilla: &Path) -> PackInfo {
 /// Packs the Resource Packs screen lists: folder and built-in packs, then any
 /// active downloaded server (or world) packs, then vanilla.
 pub(super) fn pack_infos(vanilla: &Path, server: &[Pack]) -> Vec<PackInfo> {
-    let mut infos: Vec<PackInfo> = packs::discover(vanilla, &packs_dir())
-        .iter()
-        .map(info)
-        .collect();
+    let mut infos: Vec<PackInfo> = discover(vanilla).iter().map(info).collect();
     infos.extend(server.iter().map(downloaded_info));
     infos.push(vanilla_info(vanilla));
     infos
@@ -239,7 +243,7 @@ impl Game<'_> {
     /// screen again, with the error.
     fn selection_reload_failed(&mut self, error: &str) {
         log::warn!("Horizon: resource reload failed: {error}");
-        let all = packs::discover(&self.vanilla_root(), &packs_dir());
+        let all = discover(&self.vanilla_root());
         if packs::able_to_clear_any_pack(&all, &self.settings.resource_packs) {
             // clearResourcePacksOnError.
             log::info!("Caught error loading resourcepacks, removing all selected resourcepacks");

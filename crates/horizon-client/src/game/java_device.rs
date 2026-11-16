@@ -5,10 +5,10 @@
 //! ([`horizon_jvm::device::RUNS_OWN_CHANNEL`]) gets those mods' messages, and what it sends on
 //! their channels goes to the mods' server code.
 
-use super::{Game, lan::LanHost};
+use super::{Game, Screen, lan::LanHost};
 use horizon_protocol::packets::{configuration::CustomPayload, play::Serverbound as S};
 use serde_json::{Value, json};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// The device client of this game: the server it joined and the mods running for it.
 struct Device {
@@ -77,7 +77,7 @@ fn host_port(address: &str) -> (String, u16) {
 }
 
 /// The device client's HUD (its mods' drawing), drawn over the game's HUD.
-static HUD: Mutex<Vec<Value>> = Mutex::new(Vec::new());
+static HUD: Mutex<Option<Arc<[Value]>>> = Mutex::new(None);
 /// The game's GUI size, which the device client lays its HUD and screens out in.
 static GUI_SIZE: Mutex<(i32, i32)> = Mutex::new((0, 0));
 /// The device client's screen is the one shown (a client-only screen of this game's own).
@@ -94,7 +94,7 @@ pub(super) fn gui_size(width: i32, height: i32) {
 }
 
 /// The device client's HUD operations (empty: none).
-pub(super) fn hud_ops() -> Vec<Value> {
+pub(super) fn hud_ops() -> Option<Arc<[Value]>> {
     HUD.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
@@ -136,7 +136,7 @@ pub(super) fn payload(channel: &str, data: &[u8]) {
 pub(super) fn left() {
     WAITED.store(0, std::sync::atomic::Ordering::Relaxed);
     SCREEN_OPEN.store(false, std::sync::atomic::Ordering::Relaxed);
-    HUD.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    *HUD.lock().unwrap_or_else(|e| e.into_inner()) = None;
     let mut device = DEVICE.lock().unwrap_or_else(|e| e.into_inner());
     device.own = false;
     device.screen = false;
@@ -185,7 +185,9 @@ impl Game<'_> {
             let (host, port) = host_port(&r.session.address);
             let uuid = uuid_string(r.profile());
             let name = r.profile_name.clone();
-            match horizon_jvm::device::join(&host, port, &uuid, &name) {
+            let local_ui = !self.java.overlay.enabled && !self.options.split_guest;
+            let bridge_server = r.mod_net;
+            match horizon_jvm::device::join(&host, port, &uuid, &name, local_ui) {
                 Ok(None) => return, // Java is still starting.
                 Ok(Some(mut mods)) => {
                     let mut device = DEVICE.lock().unwrap_or_else(|e| e.into_inner());
@@ -202,10 +204,12 @@ impl Game<'_> {
                     let own = device.own;
                     let data = device.mods.join(",").into_bytes();
                     drop(device);
-                    self.send(S::CustomPayload(CustomPayload {
-                        channel: horizon_jvm::device::RUNS_OWN_CHANNEL.into(),
-                        data,
-                    }));
+                    if bridge_server || !local_ui {
+                        self.send(S::CustomPayload(CustomPayload {
+                            channel: horizon_jvm::device::RUNS_OWN_CHANNEL.into(),
+                            data,
+                        }));
+                    }
                     if own {
                         self.own_client_greet();
                     }
@@ -336,7 +340,8 @@ impl Game<'_> {
             "x": p.position.x, "y": p.position.y, "z": p.position.z,
             "yaw": p.yaw, "pitch": p.pitch, "mode": mode, "health": p.health.health(),
             "food": p.health.food.food, "sat": p.health.food.saturation,
-            "perm": i32::from(sneaking) << 8, "w": w, "h": h,
+            "perm": horizon_jvm::events::player_flags(0, sneaking, self.selected as u8, 0),
+            "w": w, "h": h,
         });
         if let Some(inventory) = self.own_client_inventory() {
             state["inv"] = json!(inventory);
@@ -344,6 +349,32 @@ impl Game<'_> {
         let state = state.to_string();
         if let Err(e) = self.with_java_world(|| horizon_jvm::device::tick(&state)) {
             log::warn!("Java mods: this game's own client's tick failed: {e}");
+        }
+        self.own_client_shows();
+    }
+
+    /// Render local multiplayer mod overlays independently of network and simulation ticks.
+    pub(super) fn draw_own_client_hud_frame(&mut self) {
+        if !own_client() || self.ui.hide_gui || self.screen != Screen::Playing {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let due = self.java.next_hud_frame.unwrap_or(now);
+        if now < due {
+            return;
+        }
+        let interval = super::java_mods::HUD_FRAME_INTERVAL;
+        let next = due + interval;
+        self.java.next_hud_frame = Some(if next > now { next } else { now + interval });
+        let uuid = DEVICE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .uuid
+            .clone();
+        let look = [self.yaw, self.pitch];
+        if let Err(e) = self.with_java_world(|| horizon_jvm::events::client_hud_frame(&uuid, look))
+        {
+            log::warn!("Java mods: local HUD frame failed: {e}");
         }
         self.own_client_shows();
     }
@@ -420,7 +451,7 @@ impl Game<'_> {
     /// What the device client shows (its tick's or its input's answer): its HUD, its screen
     /// (a client-only screen of this game: `Screen::JavaMod`), its screen closing.
     fn show_device(&mut self, shown: &str) {
-        let Ok(shown) = serde_json::from_str::<Value>(shown) else {
+        let Ok(mut shown) = serde_json::from_str::<Value>(shown) else {
             return;
         };
         let window = super::java_screen::CLIENT_WINDOW;
@@ -430,14 +461,13 @@ impl Game<'_> {
             let close = json!({"window": window, "close": true}).to_string();
             self.remote_java_screen(close.as_bytes());
         }
-        if let Some(Value::Array(ops)) = shown.get("hud") {
+        if let Some(Value::Array(ops)) = shown.get_mut("hud").map(Value::take) {
             let ops = self.take_java_images(ops);
-            *HUD.lock().unwrap_or_else(|e| e.into_inner()) = ops;
+            *HUD.lock().unwrap_or_else(|e| e.into_inner()) = Some(ops.into());
         }
-        if let Some(ops) = shown.get("screen") {
+        if let Some(Value::Array(ops)) = shown.get_mut("screen").map(Value::take) {
             SCREEN_OPEN.store(true, std::sync::atomic::Ordering::Relaxed);
-            let frame = json!({"window": window, "ops": ops}).to_string();
-            self.remote_java_screen(frame.as_bytes());
+            self.apply_java_screen_frame(window, ops);
         }
     }
 

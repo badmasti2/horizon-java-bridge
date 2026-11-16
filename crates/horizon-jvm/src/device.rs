@@ -141,7 +141,13 @@ pub fn from_game(uuid: &str, channel: &str, data: &[u8]) -> Result<(), String> {
 
 /// Game: it joined another's server at `host:port` as `uuid`. `Ok(None)` while Java isn't up
 /// yet (ask again later); `Ok(Some(mods))`: the device mods running here (empty: none).
-pub fn join(host: &str, port: u16, uuid: &str, name: &str) -> Result<Option<Vec<String>>, String> {
+pub fn join(
+    host: &str,
+    port: u16,
+    uuid: &str,
+    name: &str,
+    local_ui: bool,
+) -> Result<Option<Vec<String>>, String> {
     let Some(class) = client_class() else {
         return Ok(None);
     };
@@ -153,12 +159,13 @@ pub fn join(host: &str, port: u16, uuid: &str, name: &str) -> Result<Option<Vec<
             .call_static_method(
                 class,
                 "join",
-                "(Ljava/lang/String;ILjava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+                "(Ljava/lang/String;ILjava/lang/String;Ljava/lang/String;Z)Ljava/lang/String;",
                 &[
                     JValue::Object(&host),
                     JValue::Int(port as i32),
                     JValue::Object(&uuid),
                     JValue::Object(&name),
+                    JValue::Bool(u8::from(local_ui)),
                 ],
             )?
             .l()?;

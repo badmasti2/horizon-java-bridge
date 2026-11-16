@@ -21,6 +21,7 @@ pub const RESOURCE_FORMAT: (i64, i64) = horizon_core::version::RESOURCE_PACK_FOR
 pub enum Source {
     Dir(PathBuf),
     Zip(PathBuf),
+    Embedded { jar: PathBuf, prefix: String },
 }
 #[derive(Clone, Debug)]
 pub struct Pack {
@@ -449,6 +450,9 @@ impl Pack {
         match &self.source {
             Source::Dir(d) => fs::read(d.join("pack.png")).ok(),
             Source::Zip(z) => Zip::open(z).ok()?.read("pack.png").ok(),
+            Source::Embedded { jar, prefix } => {
+                Zip::open(jar).ok()?.read(&format!("{prefix}pack.png")).ok()
+            }
         }
     }
 }
@@ -456,6 +460,10 @@ fn read_meta(source: &Source) -> Option<serde_json::Value> {
     let bytes = match source {
         Source::Dir(d) => fs::read(d.join("pack.mcmeta")).ok()?,
         Source::Zip(z) => Zip::open(z).ok()?.read("pack.mcmeta").ok()?,
+        Source::Embedded { jar, prefix } => Zip::open(jar)
+            .ok()?
+            .read(&format!("{prefix}pack.mcmeta"))
+            .ok()?,
     };
     parse_meta(&bytes)
 }
@@ -505,6 +513,40 @@ pub fn discover(resources: &Path, packs_dir: &Path) -> Vec<Pack> {
     }
     out.extend(folder(packs_dir, RESOURCE_FORMAT));
     out
+}
+
+/// Optional resource packs shipped under a Fabric mod's `resourcepacks/`.
+pub fn embedded(jars: &[PathBuf]) -> Vec<Pack> {
+    let mut found = BTreeMap::new();
+    for jar in jars {
+        let Ok(zip) = Zip::open(jar) else { continue };
+        let Some(mod_id) = zip
+            .read("fabric.mod.json")
+            .ok()
+            .and_then(|bytes| parse_meta(&bytes))
+            .and_then(|metadata| metadata["id"].as_str().map(str::to_owned))
+        else {
+            continue;
+        };
+        for name in zip.names().filter(|name| stays_inside(name)) {
+            let Some(pack_id) = name
+                .strip_prefix("resourcepacks/")
+                .and_then(|name| name.strip_suffix("/pack.mcmeta"))
+                .filter(|id| !id.contains('/'))
+            else {
+                continue;
+            };
+            let id = format!("{mod_id}:{pack_id}");
+            let source = Source::Embedded {
+                jar: jar.clone(),
+                prefix: format!("resourcepacks/{pack_id}/"),
+            };
+            if let Some(pack) = pack(id.clone(), Text::literal(id.clone()), source) {
+                found.entry(id).or_insert(pack);
+            }
+        }
+    }
+    found.into_values().collect()
 }
 /// The packs (folders and zips) in `dir`, by name, as `FolderRepositorySource`
 /// finds them; their compatibility is against `format`.
@@ -559,10 +601,14 @@ fn pack_files(pack: &Pack) -> io::Result<BTreeMap<String, Provided>> {
                 }
             }
         }
-        Source::Zip(z) => {
+        Source::Zip(z) | Source::Embedded { jar: z, .. } => {
             let zip = Zip::open(z)?;
+            let pack_root = match &pack.source {
+                Source::Embedded { prefix, .. } => prefix.as_str(),
+                _ => "",
+            };
             for root in &roots {
-                let prefix = format!("{root}assets/");
+                let prefix = format!("{pack_root}{root}assets/");
                 for name in zip.names().filter(|name| stays_inside(name)) {
                     if let Some(rest) = name.strip_prefix(&prefix) {
                         out.insert(format!("assets/{rest}"), (None, name.to_owned()));
@@ -689,12 +735,9 @@ fn build_overlay_uncached(
         .collect();
     let zips: Vec<Option<Zip>> = packs
         .iter()
-        .map(|p| {
-            if let Source::Zip(z) = &p.source {
-                Zip::open(z).ok()
-            } else {
-                None
-            }
+        .map(|p| match &p.source {
+            Source::Zip(z) | Source::Embedded { jar: z, .. } => Zip::open(z).ok(),
+            Source::Dir(_) => None,
         })
         .collect();
     // Stacked files merge every layer, vanilla's first (unless filtered).

@@ -110,7 +110,9 @@ public final class HorizonDeviceClient {
         }
         HorizonServer.ownClientTick(state.get("tick").getAsLong(), own.toString(), ownName, state.get("dim").getAsString(),
                 motion, state.get("mode").getAsInt(), state.get("health").getAsFloat(),
-                new float[] {state.get("food").getAsFloat(), state.get("sat").getAsFloat()}, state.get("perm").getAsInt(), inventory);
+                // Vanilla's remote health packet has no exhaustion value.
+                new float[] {state.get("food").getAsFloat(), state.get("sat").getAsFloat(), Float.NaN},
+                state.get("perm").getAsInt(), inventory);
     }
 
     /**
@@ -118,10 +120,10 @@ public final class HorizonDeviceClient {
      * mods' client joins. Returns the device mods' ids (comma-separated) for the game to tell the
      * server, or "" when there are none (nothing is started).
      */
-    public static String join(String host, int port, String uuid, String name) {
+    public static String join(String host, int port, String uuid, String name, boolean localUi) {
         if (!HorizonClient.headless()) return "";
         if (on || own != null) leave();
-        if (HorizonDeviceMods.OWN_CLIENT) return ownJoin(host, port, uuid, name);
+        if (localUi || HorizonDeviceMods.OWN_CLIENT) return ownJoin(host, port, uuid, name);
         var mods = HorizonDeviceMods.mods();
         if (mods.isEmpty()) return "";
         Thread.currentThread().setContextClassLoader(HorizonDeviceClient.class.getClassLoader());
@@ -141,6 +143,7 @@ public final class HorizonDeviceClient {
             level = (ClientLevel) Natives.allocate(ClientLevel.class);
             HorizonClient.set(ClientLevel.class, level, "players", new java.util.concurrent.CopyOnWriteArrayList<AbstractClientPlayer>());
             HorizonClient.set(ClientLevel.class, level, "connection", connection);
+            HorizonClient.set(ClientLevel.class, level, "worldBorder", new net.minecraft.world.level.border.WorldBorder());
             HorizonClient.set(net.minecraft.world.level.Level.class, level, "isClientSide", true);
             HorizonClient.set(net.minecraft.world.level.Level.class, level, "dimension", net.minecraft.world.level.Level.OVERWORLD);
             HorizonClient.set(ClientPacketListener.class, connection, "level", level);
@@ -149,9 +152,13 @@ public final class HorizonDeviceClient {
             HorizonClient.set(LocalPlayer.class, local, "minecraft", mc);
             HorizonClient.set(LocalPlayer.class, local, "connection", connection);
             HorizonClient.set(LocalPlayer.class, local, "input", new net.minecraft.client.player.ClientInput());
+            HorizonClient.set(LocalPlayer.class, local, "recipeBook", new net.minecraft.client.ClientRecipeBook());
+            HorizonClient.set(LocalPlayer.class, local, "firstPersonHandsAndItems", new net.minecraft.client.player.FirstPersonHandsAndItems());
+            HorizonClient.set(LocalPlayer.class, local, "chatAbilities", net.minecraft.client.multiplayer.chat.ChatAbilities.NO_RESTRICTIONS);
             level.players().add(local);
             HorizonClient.set(Minecraft.class, mc, "player", local);
             mc.level = level;
+            HorizonHooks.constructed(local, mc, level, connection, local.getGameProfile());
             on = true;
             Natives.log("Java mods: " + String.join(", ", mods) + " run here for this player, on " + host + ":" + port);
             var sender = HorizonLoop.clientSender();
@@ -190,12 +197,26 @@ public final class HorizonDeviceClient {
 
     /** A player made without its constructor: who they are, where they stand. */
     private static void person(net.minecraft.world.entity.player.Player player, UUID id, String name) throws ReflectiveOperationException {
+        var type = net.minecraft.world.entity.player.Player.class;
         HorizonClient.set(Entity.class, player, "uuid", id);
         HorizonClient.set(Entity.class, player, "stringUUID", id.toString());
         HorizonClient.set(net.minecraft.world.entity.player.Player.class, player, "gameProfile", new com.mojang.authlib.GameProfile(id, name));
         HorizonClient.set(Entity.class, player, "level", level);
         HorizonClient.set(Entity.class, player, "eyeHeight", 1.62f);
         HorizonClient.set(Entity.class, player, "dimensions", net.minecraft.world.entity.EntityDimensions.scalable(0.6f, 1.8f).withEyeHeight(1.62f));
+        var equipment = new net.minecraft.world.entity.EntityEquipment();
+        HorizonClient.set(net.minecraft.world.entity.LivingEntity.class, player, "equipment", equipment);
+        var attributes = new net.minecraft.world.entity.ai.attributes.AttributeMap(
+                net.minecraft.world.entity.ai.attributes.DefaultAttributes.getSupplier(net.minecraft.world.entity.EntityTypes.PLAYER));
+        HorizonClient.set(net.minecraft.world.entity.LivingEntity.class, player, "attributes", attributes);
+        var inventory = new net.minecraft.world.entity.player.Inventory(player, equipment);
+        HorizonClient.set(type, player, "inventory", inventory);
+        HorizonClient.set(type, player, "foodData", new net.minecraft.world.food.FoodData());
+        HorizonClient.set(type, player, "abilities", new net.minecraft.world.entity.player.Abilities());
+        var menu = new net.minecraft.world.inventory.InventoryMenu(inventory, false, player);
+        HorizonClient.set(type, player, "inventoryMenu", menu);
+        player.containerMenu = menu;
+        HorizonServer.emptyCollections(player, player.getClass());
         place(player, 0, 0, 0, 0, 0);
     }
 
@@ -248,6 +269,7 @@ public final class HorizonDeviceClient {
                 if (other == null) {
                     other = (RemotePlayer) Natives.allocate(RemotePlayer.class);
                     person(other, id, p.get("n").getAsString());
+                    HorizonHooks.constructed(other, level, other.getGameProfile());
                     OTHERS.put(id, other);
                     level.players().add(other);
                 }
@@ -287,7 +309,8 @@ public final class HorizonDeviceClient {
 
     private static net.minecraft.client.gui.screens.Screen screen;
     private static boolean closed;
-    private static String hudSent, screenSent;
+    private static String hudSent;
+    private static com.google.gson.JsonArray screenSent;
     private static double mouseX, mouseY;
 
     /** Minecraft.setScreen in the device client: the player's game shows it, or leaves it. */
@@ -331,14 +354,14 @@ public final class HorizonDeviceClient {
         }
         if (screen != null) {
             try {
-                HorizonGraphics graphics = new HorizonGraphics(HorizonClient.width, HorizonClient.height);
+                HorizonGraphics graphics = new HorizonGraphics(HorizonClient.width, HorizonClient.height, (int) mouseX, (int) mouseY);
                 graphics.imagesSent = HorizonClient.imagesSent(local.getUUID());
                 HorizonClient.mouseAt(mouseX, mouseY);
                 HorizonScreenEvents.extract(screen, graphics, (int) mouseX, (int) mouseY, 0);
-                String ops = graphics.ops().toString();
+                var ops = graphics.ops();
                 if (!ops.equals(screenSent)) {
                     screenSent = ops;
-                    out.add("screen", graphics.ops());
+                    out.add("screen", ops);
                 }
             } catch (Throwable t) {
                 Natives.log("Java mods: the device client's screen failed to draw: " + t);
@@ -505,7 +528,8 @@ public final class HorizonDeviceClient {
         on = false;
         screen = null;
         closed = false;
-        hudSent = screenSent = null;
+        hudSent = null;
+        screenSent = null;
         try {
             HorizonClient.set(Minecraft.class, mc, "player", null);
         } catch (ReflectiveOperationException e) {

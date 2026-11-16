@@ -14,7 +14,8 @@ use wgpu::util::DeviceExt;
 pub mod cit_glint;
 mod java;
 pub use java::{
-    JAVA_BIG_IMAGE_SIZE, JAVA_BIG_IMAGE_SLOTS, JAVA_IMAGE_SIZE, JAVA_IMAGE_SLOTS, java_image_slot,
+    JAVA_BIG_IMAGE_SIZE, JAVA_BIG_IMAGE_SLOTS, JAVA_IMAGE_SIZE, JAVA_IMAGE_SLOTS,
+    JAVA_SCREEN_IMAGE_SIZE, JAVA_SCREEN_IMAGE_SLOTS, java_image_slot,
 };
 mod pack_text;
 

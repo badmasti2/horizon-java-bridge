@@ -656,7 +656,12 @@ public final class HorizonEntityRender {
     private static net.minecraft.world.item.ItemStack handStack;
 
     private static boolean kept(Object model) {
-        if (firstPerson && model instanceof net.minecraft.client.model.player.PlayerModel) {
+        if (firstPerson && (model instanceof net.minecraft.client.model.player.PlayerModel
+                || model instanceof Model.Simple && WALKER.walk(frames -> frames
+                        .filter(frame -> frame.getDeclaringClass() == net.minecraft.client.renderer.entity.player.AvatarRenderer.class)
+                        .findFirst().map(frame -> frame.getMethodName().equals("renderHand")).orElse(false)))) {
+            // AvatarRenderer submits the arm as a single part wrapped in Model.Simple.
+            // Horizon renders this arm with the live skin, equip progress and swing.
             vanillaHand = true;
             return false;
         }

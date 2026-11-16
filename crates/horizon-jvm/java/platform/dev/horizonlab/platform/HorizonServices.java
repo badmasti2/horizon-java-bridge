@@ -53,6 +53,8 @@ final class HorizonServices {
             if (method.getName().equals("hashCode")) return System.identityHashCode(proxy);
             if (method.getName().equals("equals")) return proxy == args[0];
             if (method.getName().equals("toString")) return "Horizon's " + type.getSimpleName() + " (offline)";
+            if (r == com.mojang.authlib.minecraft.MinecraftProfileTextures.class)
+                return com.mojang.authlib.minecraft.MinecraftProfileTextures.EMPTY;
             if (r == Optional.class) return Optional.empty();
             if (r == boolean.class) return false;
             if (r == int.class || r == long.class || r == short.class || r == byte.class) return 0;

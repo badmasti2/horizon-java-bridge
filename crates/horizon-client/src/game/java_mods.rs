@@ -5,15 +5,27 @@
 //! `mods-java/` and Fabric API on the player's own game jar, applies their Mixins,
 //! bootstraps the game's registries and runs the mods' entrypoints.
 
+#[cfg(feature = "java-mods")]
+pub(super) const HUD_FRAME_INTERVAL: std::time::Duration =
+    std::time::Duration::from_nanos(1_000_000_000 / 120);
+
 /// The Java mods' state in the game (the `java` field of `Game`).
 #[derive(Default)]
 pub(super) struct JavaGame {
+    #[cfg(feature = "java-mods")]
+    pub(super) title: super::java_title::JavaTitle,
     /// The open window's Java mod screen, as its last frame drew it (game/java_screen.rs).
     pub(super) screen: Option<super::java_screen::JavaScreen>,
     /// The keys the server's Java mods bind (game/java_screen.rs).
     pub(super) binds: super::java_screen::JavaBinds,
     /// What Java mods last drew on the HUD (game/java_screen.rs).
     pub(super) hud: Option<super::java_screen::JavaHud>,
+    #[cfg(feature = "java-mods")]
+    pub(super) next_hud_frame: Option<std::time::Instant>,
+    /// Recently decoded item stacks referenced by Java UI frames.
+    pub(super) ui_items: std::cell::RefCell<
+        std::collections::HashMap<String, Option<horizon_client::items::ItemStack>>,
+    >,
     pub(super) overlay: super::java_screen::JavaOverlay,
     /// Java mods' dynamic textures in the atlas (game/java_screen.rs).
     pub(super) images: super::java_screen::JavaImages,

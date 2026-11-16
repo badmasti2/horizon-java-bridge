@@ -865,6 +865,42 @@ it does nothing unless Horizon fires it or hands the action to the mirror.
   for "Acquire Hardware", and an INVOKE inside `award` (before the rewards) that hears the
   rest.
 
+### Callback dispatch compatibility (2026-11-06)
+
+Client startup also initializes mod-added Minecraft fields before startup callbacks,
+assigns the client's thread before entrypoints, and installs its GUI before loading options.
+The task dispatcher updates the client thread when work moves from resource loading to
+the server thread. These address missing initialization observed in an Essential startup log;
+Essential's full startup and its features still need an in-game retest.
+
+A follow-up startup fix supplies the client's task queue for still-null fields typed as
+`Executor` after normal mixin initialization, preserving existing and static executors.
+Options load with Minecraft's `running` flag temporarily false (restored in `finally`),
+so `OptionInstance.set` stores settings without invoking callbacks into unfinished client
+services. An isolated Essential 1.5.2 run passed the former fatal executor exception and
+completed Fabric startup, server data loading and content preparation. This does not
+establish compatibility of Essential's multiplayer, screens or cosmetics.
+
+Event-like injections can omit the target method's arguments and accept only `CallbackInfo`
+or `CallbackInfoReturnable`, as Mixin allows. The census dispatcher and HUD dispatcher now
+invoke that shape as well as the full argument shape. Cancellation and return overrides still
+reach Horizon; handlers requiring captured locals remain excluded from the census dispatcher.
+An injection listing several event points (for example `HEAD` and `RETURN`) is recorded at
+each distinct point by both the census and merged-handler scanners instead of being skipped.
+
+Focused tests compile the complete `HorizonHooks` class against real Fabric Loader, Mixin,
+ASM, ASM Tree and Gson jars, with stand-ins for unrelated game services. Set
+`HORIZON_HOOK_TEST_LIBS` to a folder with those jars, then run:
+
+```sh
+python3 -m unittest discover -s tests -p test_java_bridge_hooks.py -v
+```
+
+This needs JDK 21+ and no prepared game or graphics device. It tests synthetic mod handlers;
+it does not establish that any particular mod now works in game. No external source code was
+copied; the compatibility reference is
+[Mixin's callback injector documentation](https://github.com/SpongePowered/Mixin/wiki/Advanced-Mixin-Usage---Callback-Injectors).
+
 ## Mods that draw with the GPU
 
 26.3's blaze3d GPU API is `com.mojang.renderpearl` (`api/`: `GpuDevice`, `CommandEncoder`,

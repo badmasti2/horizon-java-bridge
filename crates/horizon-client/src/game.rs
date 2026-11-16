@@ -162,6 +162,8 @@ mod java_mods;
 #[cfg(feature = "java-mods")]
 mod java_profile;
 mod java_screen;
+#[cfg(feature = "java-mods")]
+mod java_title;
 mod java_server;
 #[cfg(feature = "java-mods")]
 mod java_worldgen;
@@ -8809,6 +8811,16 @@ impl Game<'_> {
         batch
     }
     fn hud_layers(&mut self, size: [u32; 2]) -> HudBatch {
+        #[cfg(feature = "java-mods")]
+        {
+            self.close_java_pause_if_hidden();
+            if let Some(server) = &self.integrated
+                && self.player.is_some()
+            {
+                server.set_hud_look([self.yaw, self.pitch]);
+            }
+            self.draw_own_client_hud_frame();
+        }
         let mut batch = HudBatch::new(size);
         batch.glint_colour = self.settings.extras.pvp.tweaks.glint_texel();
         // GlobalSettingsUniform's GameTime, for a resource pack's text shader.
@@ -8874,6 +8886,8 @@ impl Game<'_> {
             // ScreenEvent.Render.Post over the title's own screens: a mod draws
             // over them here (a pack browser over Create New World, say), and the
             // toasts still come after, as over any screen.
+            #[cfg(feature = "java-mods")]
+            self.draw_java_title(&mut batch);
             self.fire_title_screen_render_post(&mut batch);
             self.draw_toasts(&mut batch, false);
             self.draw_tutorial_toasts(&mut batch, false);
@@ -8931,7 +8945,7 @@ impl Game<'_> {
             self.gui_layer("minecraft:hotbar", &mut batch, |g, batch| {
                 if spectator {
                     g.draw_spectator_hotbar(batch);
-                } else {
+                } else if !g.draw_java_hotbar(batch) {
                     let partial = g.clock.fraction() as f32;
                     let inputs = hud_layout::HotbarInputs {
                         selected: g.selected as i32,
@@ -9157,7 +9171,11 @@ impl Game<'_> {
             self.screen
         };
         match screen {
-            Screen::Paused if self.pause_menu => self.draw_pause_menu(&mut batch),
+            Screen::Paused if self.pause_menu => {
+                self.draw_pause_menu(&mut batch);
+                #[cfg(feature = "java-mods")]
+                self.draw_java_title(&mut batch);
+            }
             // PauseScreen(false): only its title, at the top.
             Screen::Paused => {
                 let title = self.translate("menu.paused", "Game Paused");
@@ -9800,6 +9818,7 @@ impl Game<'_> {
         self.inv_clicks.cancel_drag();
         self.inv_drag = None;
         self.last_inv_click = None;
+        self.tweaks = Default::default();
     }
     pub(super) fn close_container(&mut self) {
         // `Gui.setScreen` clears the old screen's focus before it goes: the
@@ -16818,7 +16837,11 @@ impl Game<'_> {
     /// `Screen.extractBlurredBackground` over the panorama or the world and
     /// HUD, when `menuBackgroundBlurriness` is at least 1.
     fn menu_blur(&self) -> Option<f32> {
-        let blurred = self.remote_loading()
+        #[cfg(feature = "java-mods")]
+        let java_screen = self.java_title_custom();
+        #[cfg(not(feature = "java-mods"))]
+        let java_screen = false;
+        let blurred = java_screen || self.remote_loading()
             || self.title.as_ref().is_some_and(|t| {
                 matches!(self.screen, Screen::Options | Screen::Win)
                     || !matches!(t.mode, horizon_client::title::Mode::Main)
@@ -17891,6 +17914,10 @@ impl Game<'_> {
         }
         // KeyboardHandler.keyPress: the narrator hotkey, on every screen and
         // in game, before the screen takes the key.
+        #[cfg(feature = "java-mods")]
+        if self.java_title_input(&event) {
+            return;
+        }
         if let WindowEvent::KeyboardInput { event, .. } = &event {
             self.narrator_hotkey(event);
         }

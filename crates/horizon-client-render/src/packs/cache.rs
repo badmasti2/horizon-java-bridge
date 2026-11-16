@@ -266,7 +266,7 @@ fn pack_signature(packs: &[Pack]) -> io::Result<String> {
                 field(&mut hash, absolute(path)?.as_os_str().as_encoded_bytes());
                 tree(&mut hash, path, Some(pack))?;
             }
-            Source::Zip(path) => {
+            Source::Zip(path) | Source::Embedded { jar: path, .. } => {
                 field(&mut hash, absolute(path)?.as_os_str().as_encoded_bytes());
                 // By its bytes, not its stamp: a server pack found in the download cache is
                 // marked used on every join (`HttpUtil.updateModificationTime`), and a new

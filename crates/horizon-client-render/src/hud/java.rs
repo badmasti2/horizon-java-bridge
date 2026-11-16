@@ -17,21 +17,38 @@ pub const JAVA_IMAGE_SIZE: u32 = 64;
 /// [`JAVA_BIG_IMAGE_SIZE`] square. Slot `JAVA_IMAGE_SLOTS + i` is `horizon/javabig{i}`.
 pub const JAVA_BIG_IMAGE_SLOTS: usize = 16;
 pub const JAVA_BIG_IMAGE_SIZE: u32 = 512;
+/// Full-screen mod interfaces retain native 1080p pixels without enlarging icon slots.
+pub const JAVA_SCREEN_IMAGE_SLOTS: usize = 4;
+pub const JAVA_SCREEN_IMAGE_SIZE: u32 = 2048;
 
 /// A Java image slot's atlas sprite and side (small slots first, then big ones).
 pub fn java_image_slot(slot: usize) -> (String, u32) {
     if slot < JAVA_IMAGE_SLOTS {
         (format!("horizon/java{slot}"), JAVA_IMAGE_SIZE)
-    } else {
+    } else if slot < JAVA_IMAGE_SLOTS + JAVA_BIG_IMAGE_SLOTS {
         (
             format!("horizon/javabig{}", slot - JAVA_IMAGE_SLOTS),
             JAVA_BIG_IMAGE_SIZE,
+        )
+    } else {
+        (
+            format!(
+                "horizon/javascreen{}",
+                slot - JAVA_IMAGE_SLOTS - JAVA_BIG_IMAGE_SLOTS
+            ),
+            JAVA_SCREEN_IMAGE_SIZE,
         )
     }
 }
 
 /// The Java image slots' empty images, big ones first ([`super::HudAtlas`]'s run-time slots).
 pub(super) fn java_slots(images: &mut Vec<PackedImage>) {
+    for i in JAVA_IMAGE_SLOTS + JAVA_BIG_IMAGE_SLOTS
+        ..JAVA_IMAGE_SLOTS + JAVA_BIG_IMAGE_SLOTS + JAVA_SCREEN_IMAGE_SLOTS
+    {
+        let (name, side) = java_image_slot(i);
+        images.push((name, side, side, vec![0; (side * side * 4) as usize]));
+    }
     for i in JAVA_IMAGE_SLOTS..JAVA_IMAGE_SLOTS + JAVA_BIG_IMAGE_SLOTS {
         let (name, side) = java_image_slot(i);
         images.push((name, side, side, vec![0; (side * side * 4) as usize]));

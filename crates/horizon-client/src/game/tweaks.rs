@@ -40,6 +40,16 @@ pub(super) struct Tweaks {
     drag: Option<Drag>,
     /// Wheel steps not yet acted on (a trackpad scrolls in fractions).
     wheel: f32,
+    wheel_slot: Option<usize>,
+}
+
+fn quick_put(slot: usize, right: bool) -> [(Option<usize>, i32, Input); 3] {
+    let kind = i32::from(right) << 2;
+    [
+        (None, kind, Input::QuickCraft),
+        (Some(slot), kind | 1, Input::QuickCraft),
+        (None, kind | 2, Input::QuickCraft),
+    ]
 }
 /// A server's menu the tweaks run in: their clicks are vanilla's in these,
 /// and the menu engine knows which slot takes what. Not the menus whose slots
@@ -104,19 +114,16 @@ impl Game<'_> {
     /// (the stack it was to come from just burned as fuel) ignores a drag, but
     /// a click would pick up what's in `slot`.
     fn tweak_put(&mut self, slot: usize, right: bool) -> bool {
-        let kind = i32::from(right) << 2;
-        let ops = [
-            (None, kind, Input::QuickCraft),
-            (Some(slot), kind | 1, Input::QuickCraft),
-            (None, kind | 2, Input::QuickCraft),
-        ];
-        if self.remote.is_some() {
-            return self.remote_menu_ops(&ops);
-        }
-        if !self.menu_ops(&ops) {
+        self.tweak_ops(&quick_put(slot, right))
+    }
+
+    fn tweak_ops(&mut self, ops: &[(Option<usize>, i32, Input)]) -> bool {
+        if !self.menu_ops(ops) {
             return false;
         }
-        if let Some(key) = self.container {
+        if self.remote.is_none()
+            && let Some(key) = self.container
+        {
             self.container_changed(key);
         }
         true
@@ -144,7 +151,9 @@ impl Game<'_> {
                 active: true,
                 visited: vec![slot],
             };
-            self.tweak_place(&mut drag, slot);
+            if !self.tweak_place(&mut drag, slot) {
+                return false;
+            }
             self.inv_drag = None;
             self.inv_clicks.skip_release();
             self.tweaks.drag = Some(drag);
@@ -161,16 +170,18 @@ impl Game<'_> {
         false
     }
     /// Places one held item in `slot` when it takes it.
-    fn tweak_place(&mut self, drag: &mut Drag, slot: usize) {
+    fn tweak_place(&mut self, drag: &mut Drag, slot: usize) -> bool {
         let Some(held) = drag.held.clone() else {
-            return;
+            return false;
         };
         if self.tweak_takes_one(slot, &held) && self.tweak_put(slot, true) {
             drag.held = (held.count > 1).then(|| ItemStack {
                 count: held.count - 1,
                 ..held
             });
+            return true;
         }
+        false
     }
     /// The cursor moved while a button is held: true when the tweaks own
     /// the drag (vanilla's quick craft drag doesn't grow).
@@ -227,16 +238,32 @@ impl Game<'_> {
     }
     /// The wheel over an inventory screen: true when the tweaks used it.
     pub(super) fn tweak_scroll(&mut self, delta: f32, slot: Option<usize>) -> bool {
-        if !self.settings.extras.mouse_tweaks_wheel || !self.tweaks_on() || self.carried.is_some() {
+        if self.tweaks.wheel_slot != slot {
+            self.tweaks.wheel = 0.0;
+            self.tweaks.wheel_slot = slot;
+        }
+        if !delta.is_finite()
+            || !self.settings.extras.mouse_tweaks_wheel
+            || !self.tweaks_on()
+            || self.carried.is_some()
+        {
+            self.tweaks.wheel = 0.0;
             return false;
         }
         let Some(slot) = slot else {
             self.tweaks.wheel = 0.0;
             return false;
         };
-        self.tweaks.wheel += delta;
-        let steps = self.tweaks.wheel.trunc();
-        self.tweaks.wheel -= steps;
+        // One unusually large wheel event must not queue thousands of clicks.
+        self.tweaks.wheel += delta.clamp(-16.0, 16.0);
+        let wheel = self.tweaks.wheel;
+        let nearest = wheel.round();
+        let (steps, remainder) = if (wheel - nearest).abs() < 0.000_01 {
+            (nearest, 0.0)
+        } else {
+            (wheel.trunc(), wheel.fract())
+        };
+        self.tweaks.wheel = remainder;
         for _ in 0..steps.abs() as u32 {
             if steps < 0.0 {
                 self.tweak_push(slot);
@@ -311,19 +338,16 @@ impl Game<'_> {
             return;
         };
         if self.tweak_result(slot) {
-            if self.tweak_click(slot, 0, Input::Pickup) {
-                for target in landing {
-                    self.tweak_put(target, false);
-                }
-            }
+            let mut ops = vec![(Some(slot), 0, Input::Pickup)];
+            ops.extend(
+                landing
+                    .into_iter()
+                    .flat_map(|target| quick_put(target, false)),
+            );
+            self.tweak_ops(&ops);
             return;
         }
-        if self.tweak_click(slot, 0, Input::Pickup) {
-            self.tweak_put(target, true);
-            if stack.count > 1 {
-                self.tweak_put(slot, false);
-            }
-        }
+        self.tweak_transfer(slot, target, stack.count);
     }
     /// Wheel up: one item of the same kind from the other side into `slot`.
     /// A result slot takes none and gives none.
@@ -347,12 +371,16 @@ impl Game<'_> {
         let Some((source, count)) = source else {
             return;
         };
-        if self.tweak_click(source, 0, Input::Pickup) {
-            self.tweak_put(slot, true);
-            if count > 1 {
-                self.tweak_put(source, false);
-            }
+        self.tweak_transfer(source, slot, count);
+    }
+
+    fn tweak_transfer(&mut self, source: usize, target: usize, count: u32) {
+        let mut ops = vec![(Some(source), 0, Input::Pickup)];
+        ops.extend(quick_put(target, true));
+        if count > 1 {
+            ops.extend(quick_put(source, false));
         }
+        self.tweak_ops(&ops);
     }
 }
 

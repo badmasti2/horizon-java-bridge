@@ -628,6 +628,22 @@ impl Game<'_> {
             // The chunks loading (the players', force-loaded ones, a
             // `/pregen` task) keep the workers fed until the next tick.
             self.pump_chunks(*next, paused);
+            #[cfg(feature = "java-mods")]
+            if !paused
+                && super::java_mods::has_java_mods()
+                && let Some(serving) = &self.serving
+            {
+                let owner = serving.owner;
+                let interval = super::java_mods::HUD_FRAME_INTERVAL;
+                let mut frame = Instant::now() + interval;
+                while frame + interval / 2 < *next {
+                    std::thread::sleep(frame.saturating_duration_since(Instant::now()));
+                    if let Some(look) = self.serving.as_ref().and_then(|server| server.hud_look()) {
+                        self.draw_integrated_java_hud_frame(owner, look);
+                    }
+                    frame = (frame + interval).max(Instant::now());
+                }
+            }
             let now = Instant::now();
             if *next > now {
                 std::thread::sleep(*next - now);

@@ -20,13 +20,20 @@ import org.joml.Matrix3x2f;
  */
 public final class HorizonGraphics extends GuiGraphicsExtractor {
     private final JsonArray ops = new JsonArray();
+    private final int width, height;
 
     public HorizonGraphics(int width, int height) {
-        this(width, height, new Capture());
+        this(width, height, -1, -1);
     }
 
-    private HorizonGraphics(int width, int height, Capture state) {
-        super(HorizonClient.minecraft(), state, width, height);
+    public HorizonGraphics(int width, int height, int mouseX, int mouseY) {
+        this(width, height, mouseX, mouseY, new Capture());
+    }
+
+    private HorizonGraphics(int width, int height, int mouseX, int mouseY, Capture state) {
+        super(HorizonClient.minecraft(), state, mouseX, mouseY);
+        this.width = width;
+        this.height = height;
         state.owner = this;
         // The game's GUI render state is this frame's too: mods add to it directly
         // (Xaero's World Map: gameRenderer.gameRenderState().guiRenderState, its map's blit).
@@ -120,20 +127,23 @@ public final class HorizonGraphics extends GuiGraphicsExtractor {
             Object key = java.util.List.of(state.getClass(), owner.imagesSent == null ? "" : System.identityHashCode(owner.imagesSent));
             long now = System.nanoTime();
             Object[] last = PIP_LAST.get(key);
-            if (last != null && now - (long) last[0] < PIP_INTERVAL && last[1] != null) {
-                owner.gpuQuad((Object[]) last[1], false);
+            long interval = owner.hudFrame ? HUD_IMAGE_INTERVAL : owner.highRefresh ? HIGH_REFRESH_IMAGE_INTERVAL
+                    : owner.gpuImages != null ? LARGE_IMAGE_INTERVAL : PIP_INTERVAL;
+            if (last != null && now - (long) last[0] < interval && last[1] != null) {
+                owner.gpuQuad((Object[]) last[1], owner.hudFrame || owner.gpuImages != null);
                 return;
             }
             Object[] record = {now, null};
-            PIP_LAST.put(key, record);
             owner.recording = record;
             try {
                 prepare(renderer, state, this);
+                if (record[1] != null) PIP_LAST.put(key, record);
             } catch (Throwable t) {
                 if (PIP_FAILURES.merge(state.getClass().getName(), 1, Integer::sum) <= 3) {
                     Natives.log("Horizon's client: a picture in picture (" + state.getClass().getName() + ") failed: " + t);
                     for (var f : t.getStackTrace()) Natives.log("    at " + f);
                 }
+                if (last != null && last[1] != null) owner.gpuQuad((Object[]) last[1], false);
             } finally {
                 owner.recording = null;
             }
@@ -141,8 +151,22 @@ public final class HorizonGraphics extends GuiGraphicsExtractor {
 
         @SuppressWarnings({"unchecked", "rawtypes"})
         private static void prepare(net.minecraft.client.gui.render.pip.PictureInPictureRenderer renderer,
-                                    net.minecraft.client.renderer.state.gui.pip.PictureInPictureRenderState state, GuiRenderState into) {
-            renderer.prepare(state, into, null, guiScale());
+                                    net.minecraft.client.renderer.state.gui.pip.PictureInPictureRenderState state,
+                                    GuiRenderState into) throws ReflectiveOperationException {
+            var stack = com.mojang.blaze3d.systems.RenderSystem.getModelViewStack();
+            var matrix = new org.joml.Matrix4f(stack);
+            Class<?> stackType = org.joml.Matrix4fStack.class;
+            Object depth = HorizonClient.field(stackType, stack, "curr");
+            var projection = com.mojang.blaze3d.systems.RenderSystem.getProjectionMatrixBuffer();
+            var projectionType = com.mojang.blaze3d.systems.RenderSystem.getProjectionType();
+            try {
+                renderer.prepare(state, into, null, guiScale());
+            } finally {
+                // A failed picture can leave a push behind on the shared render stack.
+                HorizonClient.set(stackType, stack, "curr", depth);
+                stack.set(matrix);
+                com.mojang.blaze3d.systems.RenderSystem.setProjectionMatrix(projection, projectionType);
+            }
         }
 
         private void capture(net.minecraft.client.renderer.state.gui.GuiElementRenderState element) {
@@ -321,8 +345,11 @@ public final class HorizonGraphics extends GuiGraphicsExtractor {
     private static final boolean DEBUG_TILED = String.valueOf(System.getenv("HORIZON_JAVA_DEBUG")).contains("tiled");
     private static final java.util.Set<String> TILED_LOGGED = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private static final boolean DEBUG_GPU = "gpu".equals(System.getenv("HORIZON_JAVA_DEBUG"));
-    /** How often a picture in picture is drawn and read back (ns): 10 a second. */
-    private static final long PIP_INTERVAL = 100_000_000L;
+    /** HUD pictures can refresh each client tick, with a small allowance for tick jitter. */
+    private static final long PIP_INTERVAL = 45_000_000L;
+    private static final long LARGE_IMAGE_INTERVAL = 33_000_000L;
+    private static final long HIGH_REFRESH_IMAGE_INTERVAL = 16_000_000L;
+    private static final long HUD_IMAGE_INTERVAL = 8_000_000L;
     /** Per picture-in-picture class and receiver: when it was last drawn, and its blit. */
     private static final java.util.Map<Object, Object[]> PIP_LAST = new java.util.concurrent.ConcurrentHashMap<>();
     /** While a picture in picture draws: where its blit is kept. */
@@ -412,7 +439,7 @@ public final class HorizonGraphics extends GuiGraphicsExtractor {
      * A captured blit of a texture of the headless client's GPU: its pixels go first (as a
      * dynamic texture's do) when they changed for the receiver, then the blit.
      */
-    private void gpuQuad(HorizonGpu.View view, float x0, float y0, float x1, float y1,
+    void gpuQuad(HorizonGpu.View view, float x0, float y0, float x1, float y1,
                          float u0, float u1, float v0, float v1, int color) {
         Object[] blit = {view, x0, y0, x1, y1, u0, u1, v0, v1, color};
         if (recording != null) recording[1] = blit;
@@ -421,11 +448,19 @@ public final class HorizonGraphics extends GuiGraphicsExtractor {
 
     /** A blit of a GPU texture ({view, x0, y0, x1, y1, u0, u1, v0, v1, color}); {@code read}: its pixels are read back. */
     private void gpuQuad(Object[] blit, boolean read) {
+        gpuQuad(blit, read, true);
+    }
+
+    private void gpuQuad(Object[] blit, boolean read, boolean baked) {
         var view = (HorizonGpu.View) blit[0];
         float x0 = (float) blit[1], y0 = (float) blit[2], x1 = (float) blit[3], y1 = (float) blit[4];
         float u0 = (float) blit[5], u1 = (float) blit[6], v0 = (float) blit[7], v1 = (float) blit[8];
         int color = (int) blit[9];
-        String name = HorizonTextures.DYNAMIC_PREFIX + "gpu" + view.id;
+        // A renderer can recreate the view every frame. Its pixels and pending readback
+        // belong to the underlying texture and mip, which survive those view changes.
+        if (!(view.texture() instanceof HorizonGpu.Texture texture)) return;
+        int mip = view.baseMipLevel();
+        String name = HorizonTextures.DYNAMIC_PREFIX + "gpu" + texture.id + (mip == 0 ? "" : "/" + mip);
         if (DEBUG_GPU) Natives.log("gpu: a blit of " + name + " " + view.getWidth(0) + "x" + view.getHeight(0) + " at " + x0 + "," + y0 + " " + x1 + "," + y1
                 + " uv " + u0 + "," + v0 + " " + u1 + "," + v1 + (modsOnly && !drawnByModNow() ? " (not a mod's)" : ""));
         var across = repeats(x0, x1, u0, u1);
@@ -437,13 +472,13 @@ public final class HorizonGraphics extends GuiGraphicsExtractor {
             boolean first = read;
             for (float[] h : across) {
                 for (float[] v : down) {
-                    gpuQuad(new Object[] {view, h[0], v[0], h[1], v[1], h[2], h[3], v[2], v[3], color}, first);
+                    gpuQuad(new Object[] {view, h[0], v[0], h[1], v[1], h[2], h[3], v[2], v[3], color}, first, baked);
                     first = false;
                 }
             }
             return;
         }
-        if (read && imagesSent != null && (!modsOnly || drawnByModNow())) {
+        if (read && imagesSent != null && (!modsOnly || drawnByModNow()) && queuedReads.add(name)) {
             // Its pixels are read when the frame's ops are taken, not now: a mod may still draw
             // into the target (or clear it first: XaeroPlus clears the World Map's target as
             // it adds its GUI element, and draws the map after), as the real game's GUI draws
@@ -453,7 +488,7 @@ public final class HorizonGraphics extends GuiGraphicsExtractor {
             pendingReads.add(new Object[]{image, view, name});
         }
         pose().pushMatrix();
-        pose().identity();
+        if (baked) pose().identity();
         try {
             JsonObject o = op("blit");
             o.addProperty("texture", name);
@@ -473,6 +508,7 @@ public final class HorizonGraphics extends GuiGraphicsExtractor {
 
     /** Image ops waiting for their GPU texture's pixels: {placeholder, view, name}. */
     private final java.util.List<Object[]> pendingReads = new java.util.ArrayList<>();
+    private final java.util.Set<String> queuedReads = new java.util.HashSet<>();
 
     /** Fills the image ops of the GPU textures blitted this frame, or drops them (no change). */
     private void readPending() {
@@ -481,27 +517,36 @@ public final class HorizonGraphics extends GuiGraphicsExtractor {
             var image = (JsonObject) p[0];
             var view = (HorizonGpu.View) p[1];
             var name = (String) p[2];
-            // A big target (a full-screen map: the window's size) is read at most PIP_INTERVAL
-            // apart for each receiver, and sent shrunk to the window's largest image (512 px).
+            // Menu readbacks run asynchronously even for small textures. Full-screen
+            // interfaces keep native pixels up to 2048.
             int w = view.getWidth(0), h = view.getHeight(0);
+            boolean big = Math.max(w, h) > 512;
             int shrink = Math.max(1, (Math.max(w, h) + MAX_IMAGE - 1) / MAX_IMAGE);
-            Object key = java.util.List.of(name, System.identityHashCode(imagesSent));
-            long now = System.nanoTime();
-            Long last = shrink > 1 ? BIG_LAST.get(key) : null;
-            byte[] rgba = last != null && now - last < PIP_INTERVAL || view.isClosed() ? null : HorizonGpu.pixels(view);
+            Object key = big ? java.util.List.of(name, System.identityHashCode(imagesSent)) : null;
+            long now = big ? System.nanoTime() : 0;
+            Long last = big && imagesSent.containsKey(name) ? BIG_LAST.get(key) : null;
+            // A completed asynchronous read takes at least one more frame to arrive.
+            long interval = hudFrame ? HUD_IMAGE_INTERVAL : highRefresh ? HIGH_REFRESH_IMAGE_INTERVAL / 2 : LARGE_IMAGE_INTERVAL;
+            byte[] rgba = (last != null && now - last < interval)
+                    ? null : HorizonGpu.pixels(view, hudFrame || big || gpuImages != null);
+            if (rgba != null && big) BIG_LAST.put(key, now);
             if (rgba != null && shrink > 1) {
-                BIG_LAST.put(key, now);
                 rgba = shrink(rgba, w, h, shrink);
-                w /= shrink;
-                h /= shrink;
+                w = Math.max(1, w / shrink);
+                h = Math.max(1, h / shrink);
             }
             if (DEBUG_GPU) debugImage(name, w, h, rgba);
-            int version = rgba == null ? 0 : java.util.Arrays.hashCode(rgba);
+            int version = rgba == null ? 0 : 31 * (31 * w + h) + java.util.Arrays.hashCode(rgba);
             if (rgba == null || Integer.valueOf(version).equals(imagesSent.get(name))) {
                 drop.add(image);
                 continue;
             }
             imagesSent.put(name, version);
+            if (gpuImages != null) {
+                gpuImages.add(new Object[]{name, new int[]{w, h}, rgba});
+                drop.add(image);
+                continue;
+            }
             image.addProperty("op", "image");
             image.addProperty("name", name);
             image.addProperty("width", w);
@@ -516,21 +561,28 @@ public final class HorizonGraphics extends GuiGraphicsExtractor {
     }
 
     /** The largest image the window takes (its big image slots), in pixels on a side. */
-    private static final int MAX_IMAGE = 512;
-    private static final java.util.Map<Object, Long> BIG_LAST = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final int MAX_IMAGE = 2048;
+    private static final java.util.Map<Object, Long> BIG_LAST = java.util.Collections.synchronizedMap(
+            new java.util.LinkedHashMap<Object, Long>(32, 0.75F, true) {
+                @Override protected boolean removeEldestEntry(java.util.Map.Entry<Object, Long> eldest) {
+                    return size() > 256;
+                }
+            });
 
     /** RGBA rows {@code w} x {@code h}, each {@code k} x {@code k} block averaged into one pixel. */
     static byte[] shrink(byte[] rgba, int w, int h, int k) {
-        int nw = w / k, nh = h / k;
+        int nw = Math.max(1, w / k), nh = Math.max(1, h / k);
         byte[] out = new byte[nw * nh * 4];
-        int n = k * k;
         for (int y = 0; y < nh; y++) {
+            int y0 = y * k, y1 = y == nh - 1 ? h : y0 + k;
             for (int x = 0; x < nw; x++) {
+                int x0 = x * k, x1 = x == nw - 1 ? w : x0 + k;
+                int n = (x1 - x0) * (y1 - y0);
                 int r = 0, g = 0, b = 0, a = 0;
-                for (int dy = 0; dy < k; dy++) {
-                    int row = ((y * k + dy) * w + x * k) * 4;
-                    for (int dx = 0; dx < k; dx++) {
-                        int p = row + dx * 4;
+                for (int sy = y0; sy < y1; sy++) {
+                    int row = sy * w * 4;
+                    for (int sx = x0; sx < x1; sx++) {
+                        int p = row + sx * 4;
                         r += rgba[p] & 255;
                         g += rgba[p + 1] & 255;
                         b += rgba[p + 2] & 255;
@@ -671,12 +723,13 @@ public final class HorizonGraphics extends GuiGraphicsExtractor {
     /** Horizon's GUI size (the screen has no window to ask; read in the constructor too). */
     @Override
     public int guiWidth() {
-        return HorizonClient.width;
+        // The superclass calls this before our fields are assigned, to seed its scissor stack.
+        return width > 0 ? width : HorizonClient.width;
     }
 
     @Override
     public int guiHeight() {
-        return HorizonClient.height;
+        return height > 0 ? height : HorizonClient.height;
     }
 
     /** The frame's operations, in order. */
@@ -692,6 +745,9 @@ public final class HorizonGraphics extends GuiGraphicsExtractor {
      * vanilla class (Fabric's own are vanilla's here: its HUD wrapper draws vanilla parts).
      */
     boolean modsOnly;
+    java.util.List<Object[]> gpuImages;
+    boolean highRefresh;
+    boolean hudFrame;
     /** What the frame's receiver has of dynamic textures (name to version): HorizonTextures.imageOp. */
     java.util.Map<String, Integer> imagesSent;
 
@@ -703,6 +759,14 @@ public final class HorizonGraphics extends GuiGraphicsExtractor {
 
     private static final java.util.Map<String, Boolean> MOD_FRAMES = new java.util.concurrent.ConcurrentHashMap<>();
     private static final StackWalker WALKER = StackWalker.getInstance(StackWalker.Option.RETAIN_CLASS_REFERENCE);
+    private static final ClassValue<Boolean> PLATFORM_FRAME = new ClassValue<>() {
+        @Override protected Boolean computeValue(Class<?> owner) {
+            String name = owner.getName();
+            return name.startsWith("net.minecraft.") || name.startsWith("com.mojang.") || name.startsWith("net.fabricmc.")
+                    || name.startsWith("java.") || name.startsWith("jdk.") || name.startsWith("sun.") || name.startsWith("org.joml.")
+                    || name.startsWith("com.google.") || name.startsWith("it.unimi.") || name.startsWith("org.spongepowered.");
+        }
+    };
 
     private static boolean drawnByMod() {
         return WALKER.walk(frames -> {
@@ -718,21 +782,21 @@ public final class HorizonGraphics extends GuiGraphicsExtractor {
                     continue;
                 }
                 if (name.startsWith("dev.horizonlab.")) return false;
-                Boolean mod = MOD_FRAMES.computeIfAbsent(name + "#" + frame.getMethodName() + frame.getDescriptor(),
-                        k -> isModFrame(owner, frame));
-                if (mod) return true;
+                if (isModFrame(owner, frame)) return true;
             }
             return false;
         });
     }
 
     static boolean isModFrame(Class<?> owner, StackWalker.StackFrame frame) {
-        String name = owner.getName();
-        boolean platform = name.startsWith("net.minecraft.") || name.startsWith("com.mojang.") || name.startsWith("net.fabricmc.")
-                || name.startsWith("java.") || name.startsWith("jdk.") || name.startsWith("sun.") || name.startsWith("org.joml.")
-                || name.startsWith("com.google.") || name.startsWith("it.unimi.") || name.startsWith("org.spongepowered.");
-        if (!platform) return true;
-        if (!frame.getMethodName().contains("$")) return false;
+        if (!PLATFORM_FRAME.get(owner)) return true;
+        String methodName = frame.getMethodName();
+        if (methodName.indexOf('$') < 0) return false;
+        return MOD_FRAMES.computeIfAbsent(owner.getName() + "#" + methodName + frame.getDescriptor(),
+                ignored -> isMergedModFrame(owner, frame));
+    }
+
+    private static boolean isMergedModFrame(Class<?> owner, StackWalker.StackFrame frame) {
         try {
             var method = owner.getDeclaredMethod(frame.getMethodName(), frame.getMethodType().parameterArray());
             var merged = method.getAnnotation(org.spongepowered.asm.mixin.transformer.meta.MixinMerged.class);
@@ -775,14 +839,9 @@ public final class HorizonGraphics extends GuiGraphicsExtractor {
 
     private void image(Identifier texture, int x, int y, float u, float v, int w, int h,
                        int uw, int vh, int texW, int texH, int color) {
-        JsonObject o = op("blit");
-        o.addProperty("texture", texture.toString());
-        rect(o, x, y, x + w, y + h);
-        o.addProperty("u0", u / texW);
-        o.addProperty("u1", (u + uw) / texW);
-        o.addProperty("v0", v / texH);
-        o.addProperty("v1", (v + vh) / texH);
-        if (color != -1) o.addProperty("color", color);
+        int before = ops.size();
+        blit(texture, x, y, x + w, y + h, u / texW, (u + uw) / texW, v / texH, (v + vh) / texH);
+        if (color != -1 && ops.size() > before) ops.get(ops.size() - 1).getAsJsonObject().addProperty("color", color);
     }
 
     @Override
@@ -849,6 +908,25 @@ public final class HorizonGraphics extends GuiGraphicsExtractor {
     @Override
     public void blit(Identifier texture, int x0, int y0, int x1, int y1, float u0, float u1, float v0, float v1) {
         String name = texture.toString();
+        // A registered name can refer to a render target rather than a resource-pack
+        // image. Read its pixels just like a GPU view submitted through a render state.
+        if (HorizonGpu.installed()) {
+            var loaded = HorizonClient.minecraft().getTextureManager().getTexture(texture);
+            if (HorizonHooks.DEBUG && DEBUG_NAMES.add("named:" + texture)) dev.horizonlab.bridge.Natives.log(
+                    "GUI texture: " + texture + " -> " + loaded.getClass().getName() + " / " + loaded.getTextureView());
+            if (loaded.getTextureView() instanceof HorizonGpu.View view && !HorizonGpu.atlas(view)) {
+                gpuQuad(new Object[] {view, (float) x0, (float) y0, (float) x1, (float) y1, u0, u1, v0, v1, -1}, true, false);
+                return;
+            }
+            if (loaded.getTextureView() instanceof HorizonTextures.View view
+                    && view.name().startsWith(HorizonTextures.DYNAMIC_PREFIX)) {
+                name = view.name();
+                if (!modsOnly || drawnByModNow()) {
+                    var image = HorizonTextures.imageOp(name, imagesSent);
+                    if (image != null) ops.add(image);
+                }
+            }
+        }
         // An atlas blitted with a sprite's own UVs (corelib's submitSprite: its screens'
         // backgrounds): the sprite's texture, by its UV square (HorizonSprites).
         if (name.contains("textures/atlas/") && u1 > u0 && Math.floor(u0 + 1e-4) == Math.floor(u1 - 1e-4)) {
@@ -1133,6 +1211,11 @@ public final class HorizonGraphics extends GuiGraphicsExtractor {
 
     @Override
     public void item(ItemStack stack, int x, int y, int seed) {
+        item("item", stack, x, y);
+    }
+
+    @Override
+    public void item(net.minecraft.world.entity.LivingEntity owner, ItemStack stack, int x, int y, int seed) {
         item("item", stack, x, y);
     }
 

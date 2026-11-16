@@ -604,6 +604,8 @@ public final class HorizonServer {
                     java.lang.reflect.Field containers = Level.class.getDeclaredField("palettedContainerFactory");
                     containers.setAccessible(true);
                     containers.set(level, net.minecraft.world.level.chunk.PalettedContainerFactory.create(registries));
+                    HorizonClient.set(Level.class, level, "biomeManager", new net.minecraft.world.level.biome.BiomeManager(
+                            level, net.minecraft.world.level.biome.BiomeManager.obfuscateSeed(seed)));
                 } catch (ReflectiveOperationException e) {
                     Natives.log("Java mods: a level has no paletted containers: " + e);
                 }
@@ -689,6 +691,7 @@ public final class HorizonServer {
     /** The integrated world closes: the client connection ends, what mods do then is waited for. */
     public static void clientClosed() {
         HorizonPacketTap.close(true);
+        if (client) HorizonClient.worldClosed();
     }
 
     /** Mods Horizon left out of Fabric's (Sodium, Iris), one line each: told at the players' join. */
@@ -1042,7 +1045,7 @@ public final class HorizonServer {
     /** Player {@code i} of a tick's arrays, mirrored as Horizon gives it (made the first time). */
     private static ServerPlayer mirrorPlayer(int i, String[] ids, String[] names, String[] dimensions, double[] motion,
                                              int[] modes, float[] health, float[] food, int[] permissions,
-                                             String[] inventories, long tick) {
+                                             String[] inventories, long tick) throws ReflectiveOperationException {
         UUID uuid = UUID.fromString(ids[i]);
         ServerLevel level = level(dimensions[i]);
         ServerPlayer player = player(uuid, names[i], level);
@@ -1057,11 +1060,15 @@ public final class HorizonServer {
         player.setYHeadRot((float) motion[i * 5 + 3]);
         player.setYBodyRot((float) motion[i * 5 + 3]);
         player.setHealth(health[i]);
-        if (food != null && food.length >= (i + 1) * 2) {
+        int foodOffset = i * 3;
+        if (food != null && food.length >= foodOffset + 3) {
             var data = player.getFoodData();
-            data.setFoodLevel((int) food[i * 2]);
-            data.setSaturation(food[i * 2 + 1]);
-            FOOD_SEEN.put(uuid, new float[] {food[i * 2], food[i * 2 + 1]});
+            data.setFoodLevel((int) food[foodOffset]);
+            data.setSaturation(food[foodOffset + 1]);
+            if (Float.isFinite(food[foodOffset + 2])) {
+                HorizonClient.set(net.minecraft.world.food.FoodData.class, data, "exhaustionLevel", food[foodOffset + 2]);
+            }
+            FOOD_SEEN.put(uuid, new float[] {food[foodOffset], food[foodOffset + 1]});
         }
         MODES.put(uuid, modes[i]);
         // Horizon's game mode, so mods see it (ServerPlayer.setGameMode: abilities
@@ -1077,6 +1084,10 @@ public final class HorizonServer {
         }
         // The permission level (low 8 bits) and the sneak key (bit 8).
         PERMISSIONS.put(uuid, permissions[i] & 0xff);
+        // The selected slot (bits 9–12) can change without an inventory update or an item action.
+        int selected = (permissions[i] >> 9) & 0xf;
+        var inventory = player.getInventory();
+        if (selected < 9 && inventory.getSelectedSlot() != selected) inventory.setSelectedSlot(selected);
         // tickCount moves with Horizon's ticks (the mirror isn't ticked): Carry On
         // refuses a second action on the tick of the last one, which was every tick.
         player.tickCount = (int) tick;
@@ -1164,6 +1175,14 @@ public final class HorizonServer {
         ServerPlayer player = BY_UUID.remove(id);
         if (player != null) PLAYERS.remove(player);
         if (client) HorizonClient.left(id);
+    }
+
+    /** A local HUD frame while its simulation waits for the next tick. */
+    public static void clientHudFrame(String id, float yaw, float pitch) {
+        if (client) {
+            var player = player(UUID.fromString(id));
+            if (player != null) HorizonClient.clientHudFrame(player, yaw, pitch);
+        }
     }
 
     /** A mirrored player by id; null when Horizon doesn't list them. */
@@ -1427,7 +1446,7 @@ public final class HorizonServer {
      * @param world Horizon's world folder
      * @param motion five values per player: x, y, z, yaw, pitch
      * @param permissions per player: vanilla's permission level, 0 to 4, in the low 8 bits; bit 8 the sneak key;
-     *     bits 16-22 the movement keys (PlayerInput's flags)
+     *     bits 9-12 the selected hotbar slot; bits 16-22 the movement keys (PlayerInput's flags)
      * @param kinds per event: 0 joined, 1 left, 2 chat, 3 broke a block, 4 placed a block, 5 died
      *     (texts: the damage type), 6 respawned
      * @param who per event: the player's UUID

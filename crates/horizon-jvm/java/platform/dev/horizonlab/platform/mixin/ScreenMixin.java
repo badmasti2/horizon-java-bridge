@@ -28,7 +28,7 @@ public abstract class ScreenMixin {
     @Inject(method = "extractMenuBackground(Lnet/minecraft/client/gui/GuiGraphicsExtractor;IIII)V",
             at = @At("HEAD"), cancellable = true)
     private void horizon$menuBackground(GuiGraphicsExtractor graphics, int x, int y, int width, int height, CallbackInfo ci) {
-        if (!HorizonClient.headless()) return;
+        if (!HorizonClient.headless() || dev.horizonlab.platform.HorizonTitle.usesTitleBackground()) return;
         ci.cancel();
         Screen.extractMenuBackgroundTexture(graphics, INWORLD_MENU_BACKGROUND, x, y, 0, 0, width, height);
     }

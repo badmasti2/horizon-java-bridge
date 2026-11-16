@@ -24,6 +24,16 @@ import net.fabricmc.loader.impl.launch.knot.Knot;
  */
 public final class FabricBoot {
     private FabricBoot() {}
+    private static String[] clientSession;
+    public static void setClientSession(String name, String uuid, String token, String xuid) {
+        clientSession = new String[] {name, uuid, token, xuid};
+    }
+    /** One in-process handoff; credentials are never serialized or logged. */
+    public static String[] takeClientSession() {
+        var session = clientSession;
+        clientSession = null;
+        return session;
+    }
 
     private static ClassLoader gameLoader;
 

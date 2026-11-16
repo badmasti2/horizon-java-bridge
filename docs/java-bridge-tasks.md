@@ -2145,3 +2145,43 @@ entity, without its client spawn data); cancelling Horizon's own attack when mod
 `startAttack` (TACZ: no punch or block break with a gun); third-person aiming pose; zoom/recoil
 on Horizon's camera; the item name shows `block.tacz.modern_kinetic_gun` (the gun's name is
 its mod's, from its data).
+
+### Callback compatibility (2026-11-06, local branch `bridge-callback-only-handlers`; Codex)
+
+Generic fixes in `HorizonHooks`: callback-only handlers for targets with arguments now run
+through the census and HUD dispatchers, including cancellation and return overrides. Injections
+with several event points (`HEAD`, `RETURN`, `TAIL`) are recorded at every distinct point in
+both scanners. Captured locals still require a vanilla frame and remain excluded by the census.
+
+Validation: 16 synthetic-mod tests pass using the complete production `HorizonHooks` class,
+real Fabric Loader/Mixin/ASM/Gson jars and stand-ins for unrelated game services. Eight fail
+against the original source. `nomodcode`, public-tree and diff whitespace checks pass. Run
+`HORIZON_HOOK_TEST_LIBS=<jar folder> python3 -m unittest discover -s tests -p test_java_bridge_hooks.py -v`.
+Additional coverage includes partially initialized fields, renamed constructor lambdas,
+client executor dispatch and constructor startup milestones. The GPU resource-lifetime
+regression test passes on Vulkan. The Java platform compiles against the player's 26.3 jar;
+the Rust client builds with Java mods enabled. Full `pr_ready.py` has not been completed.
+
+Essential 1.5.2 loads in an isolated playtest, initializes its dispatcher and completes the
+client model reload. The final executable renders its menu and settings, converts mod GUI
+scales, returns to the menu and preserves native singleplayer navigation without bridge or
+GPU validation failures. Both GPU regression tests pass. The Java mirror uses an offline
+profile: Essential's online/social features remain unfinished. Full modpacks are unverified.
+No external source copied. Local changes only; no push, issue or PR posted.
+
+### UI and world-entry fixes (2026-11-07; Codex)
+
+Screen captures retain up to 2048 pixels per axis, with dedicated large image slots
+and window/GUI scale conversion. Title input follows vanilla mouse and keyboard hooks.
+Native button callbacks mark navigation requests so mod popups can block the underlying
+Horizon menu. Escape, popup click blocking and normal singleplayer navigation were tested.
+
+Frame cleanup now ends RenderBuffers as well as GPU/uniform work. The three shared
+256 KiB buffers previously leaked every frame; the isolated 1920x1080 test instead
+stabilizes below 1 MiB of native buffers. Three GPU lifetime regressions pass.
+
+World entry dispatches server constructor handlers once, initializes per-connection
+mixin fields and command trees before packet return hooks, and supplies a real vanilla
+delta timer. Offline texture lookups return EMPTY. Essential world-entry testing no
+longer produces the three reproduced chat failures or the repeated null encoder error.
+Online Essential authentication remains unimplemented by the Java mirror.

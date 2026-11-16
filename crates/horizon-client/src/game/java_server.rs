@@ -1375,58 +1375,54 @@ mod run {
                     .map_or([self.yaw, self.pitch], |g| [g.yaw, g.pitch])
             };
             // A connection's food, or the window's own player's in-frame.
-            let food = |id: &str| -> (i32, f32) {
+            let food = |id: &str| -> (i32, f32, f32) {
                 self.lan
                     .iter()
                     .flat_map(|h| &h.hub.guests)
                     .find(|g| uuid_string(g.uuid) == id)
-                    .map(|g| (g.food, g.saturation))
-                    .or_else(|| {
-                        self.player
-                            .as_ref()
-                            .map(|p| (p.health.food.food, p.health.food.saturation))
+                    .map(|g| {
+                        let exhaustion =
+                            g.motion.as_ref().map_or(0.0, |p| p.health.food.exhaustion);
+                        (g.food, g.saturation, exhaustion)
                     })
-                    .unwrap_or((20, 5.0))
+                    .or_else(|| {
+                        self.player.as_ref().map(|p| {
+                            let food = &p.health.food;
+                            (food.food, food.saturation, food.exhaustion)
+                        })
+                    })
+                    .unwrap_or((20, 5.0, 0.0))
             };
             let players: Vec<horizon_jvm::events::Player> = players
                 .iter()
-                .map(|p| horizon_jvm::events::Player {
-                    uuid: p.id.clone(),
-                    name: p.name.clone(),
-                    position: [p.x, p.y, p.z],
-                    yaw: rotation(&p.id)[0],
-                    pitch: rotation(&p.id)[1],
-                    dimension: p.dimension.clone(),
-                    game_mode: p.game_mode,
-                    health: p.health,
-                    food: food(&p.id).0,
-                    saturation: food(&p.id).1,
-                    // A connection's level (ops, the LAN host's grant); the window's own player
-                    // in-frame owns its world.
-                    permission: self
+                .map(|p| {
+                    let (food, saturation, exhaustion) = food(&p.id);
+                    let guest = self
                         .lan
                         .iter()
                         .flat_map(|h| &h.hub.guests)
-                        .find(|g| uuid_string(g.uuid) == p.id)
-                        .map_or(4, |g| g.permission),
-                    sneaking: self
-                        .lan
-                        .iter()
-                        .flat_map(|h| &h.hub.guests)
-                        .any(|g| uuid_string(g.uuid) == p.id && g.sneaking),
-                    // A connection's keys (PlayerInput): a mod's mob it rides steers by them.
-                    input: self
-                        .lan
-                        .iter()
-                        .flat_map(|h| &h.hub.guests)
-                        .find(|g| uuid_string(g.uuid) == p.id)
-                        .map_or(0, |g| g.input),
-                    inventory: self
-                        .lan
-                        .iter()
-                        .flat_map(|h| &h.hub.guests)
-                        .find(|g| uuid_string(g.uuid) == p.id)
-                        .and_then(java_inventory),
+                        .find(|g| uuid_string(g.uuid) == p.id);
+                    horizon_jvm::events::Player {
+                        uuid: p.id.clone(),
+                        name: p.name.clone(),
+                        position: [p.x, p.y, p.z],
+                        yaw: rotation(&p.id)[0],
+                        pitch: rotation(&p.id)[1],
+                        dimension: p.dimension.clone(),
+                        game_mode: p.game_mode,
+                        health: p.health,
+                        food,
+                        saturation,
+                        exhaustion,
+                        // A connection's level (ops, the LAN host's grant); the window's own player
+                        // in-frame owns its world.
+                        permission: guest.map_or(4, |g| g.permission),
+                        sneaking: guest.is_some_and(|g| g.sneaking),
+                        selected: guest.map_or(self.selected, |g| g.selected) as u8,
+                        // A connection's keys (PlayerInput): a mod's mob it rides steers by them.
+                        input: guest.map_or(0, |g| g.input),
+                        inventory: guest.and_then(java_inventory),
+                    }
                 })
                 .collect();
             // Not `options.dedicated`: single player's server thread sets it too.
@@ -1918,6 +1914,14 @@ mod run {
                     }),
                 );
             }
+        }
+
+        pub(in crate::game) fn draw_integrated_java_hud_frame(&mut self, owner: u128, look: [f32; 2]) {
+            let uuid = uuid_string(owner);
+            if let Err(e) = self.with_java_world(|| horizon_jvm::events::client_hud_frame(&uuid, look)) {
+                log::warn!("Java mods: local HUD frame failed: {e}");
+            }
+            self.apply_java_actions(None);
         }
 
         fn apply_java_actions(&mut self, mut host: Option<&mut LanHost>) {

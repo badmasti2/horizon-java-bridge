@@ -50,10 +50,37 @@ public final class HorizonMixinInit {
     private static final java.util.Set<String> RAN = ConcurrentHashMap.newKeySet();
     private static final MethodHandle NONE = MethodHandles.constant(Object.class, null);
 
+    /** Move constructor-created client components with the mirror's task thread, keeping queues. */
+    static void rebindThread(Object self, Thread previous, Thread current) {
+        var seen = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<Object, Boolean>());
+        for (Class<?> owner = self.getClass(); owner != null; owner = owner.getSuperclass()) {
+            var inits = BY_TARGET.get(owner.getName().replace('.', '/'));
+            if (inits == null) continue;
+            for (var init : inits) for (String name : init.writes()) {
+                try {
+                    var field = owner.getDeclaredField(name);
+                    if (java.lang.reflect.Modifier.isStatic(field.getModifiers())) continue;
+                    field.setAccessible(true);
+                    Object component = field.get(self);
+                    if (component == null || component instanceof Thread || !seen.add(component)) continue;
+                    for (Class<?> type = component.getClass(); type != null; type = type.getSuperclass()) {
+                        for (var thread : type.getDeclaredFields()) {
+                            if (thread.getType() != Thread.class || java.lang.reflect.Modifier.isStatic(thread.getModifiers())) continue;
+                            thread.setAccessible(true);
+                            if (thread.get(component) == previous) thread.set(component, current);
+                        }
+                    }
+                } catch (ReflectiveOperationException | RuntimeException e) {
+                    if (HorizonHooks.DEBUG) Natives.log("Mixin fields: could not move client component " + name + ": " + e);
+                }
+            }
+        }
+    }
+
     /** Reads a mixin class's initializer (HorizonHooks' scan of the mods' mixin classes). */
     static void read(ClassNode node, List<String> targets) {
         for (MethodNode m : node.methods) {
-            if (!m.name.equals("<init>") || !m.desc.equals("()V")) continue;
+            if (!m.name.equals("<init>")) continue;
             int from = -1;
             for (int i = 0; i < m.instructions.size(); i++) {
                 if (m.instructions.get(i) instanceof MethodInsnNode c && c.getOpcode() == Opcodes.INVOKESPECIAL
@@ -71,13 +98,14 @@ public final class HorizonMixinInit {
                 }
             }
             if (writes.isEmpty()) continue;
+            if (HorizonHooks.DEBUG) Natives.log("Mixin fields: found " + node.name + " " + m.desc + " -> " + writes);
             for (String t : targets) BY_TARGET.computeIfAbsent(t, k -> new ArrayList<>()).add(new Init(node.name, m, from, writes));
         }
     }
 
     /**
      * Runs the initializers of the mixins on {@code owner} (one of {@code self}'s classes) whose
-     * fields are all still unset (a reference null): an object made without its constructor.
+     * reference fields are still unset, preserving fields that already have values.
      */
     static void run(Object self, Class<?> owner) {
         HorizonHooks.scanNow();
@@ -100,14 +128,6 @@ public final class HorizonMixinInit {
         }
     }
 
-    private static boolean isFinal(Class<?> owner, String name) {
-        try {
-            return java.lang.reflect.Modifier.isFinal(owner.getDeclaredField(name).getModifiers());
-        } catch (NoSuchFieldException e) {
-            return false;
-        }
-    }
-
     private static String box(Type t) {
         return switch (t.getSort()) {
             case Type.BOOLEAN -> "Ljava/lang/Boolean;";
@@ -123,7 +143,7 @@ public final class HorizonMixinInit {
 
     private static final Map<String, java.lang.reflect.Field> FIELDS = new ConcurrentHashMap<>();
 
-    /** A copied initializer's write of a final field (the object's class or a superclass declares it). */
+    /** A copied initializer's write, preserving existing references and nondefault primitives. */
     public static void put(Object self, Object value, String name) throws ReflectiveOperationException {
         var field = FIELDS.get(self.getClass().getName() + "." + name);
         if (field == null) {
@@ -138,7 +158,12 @@ public final class HorizonMixinInit {
             field.setAccessible(true);
             FIELDS.put(self.getClass().getName() + "." + name, field);
         }
-        field.set(self, value);
+        Object current = field.get(self);
+        if (current == null || field.getType().isPrimitive() && (
+                current instanceof Number n && n.doubleValue() == 0
+                || Boolean.FALSE.equals(current) || Character.valueOf('\0').equals(current))) {
+            field.set(self, value);
+        }
     }
 
     private static boolean unset(Object self, Class<?> owner, List<String> fields) {
@@ -149,10 +174,10 @@ public final class HorizonMixinInit {
                 if (java.lang.reflect.Modifier.isStatic(field.getModifiers())) continue;
                 if (field.getType().isPrimitive()) continue;
                 field.setAccessible(true);
-                if (field.get(self) != null) return false;
-                any = true;
+                any |= field.get(self) == null;
             } catch (ReflectiveOperationException | RuntimeException e) {
                 // Mixin renamed it (a conflict): the copy wouldn't link.
+                if (HorizonHooks.DEBUG) Natives.log("Mixin fields: can't resolve " + owner.getName() + "." + name + ": " + e);
                 return false;
             }
         }
@@ -181,7 +206,7 @@ public final class HorizonMixinInit {
         ClassNode out = new ClassNode();
         out.version = Opcodes.V21;
         out.access = Opcodes.ACC_FINAL | Opcodes.ACC_SUPER | Opcodes.ACC_SYNTHETIC;
-        out.name = pkg + "HorizonMixinInit";
+        out.name = pkg + "HorizonCopiedMixinInit";
         out.superName = "java/lang/Object";
         MethodNode m = new MethodNode(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC, "init", "(L" + target + ";)V", null, null);
         Map<LabelNode, LabelNode> labels = new HashMap<>();
@@ -189,14 +214,21 @@ public final class HorizonMixinInit {
         InsnList code = new InsnList();
         for (int i = init.from(); i < init.ctor().instructions.size(); i++) {
             AbstractInsnNode insn = init.ctor().instructions.get(i);
+            // A mixin may extend a target with a parameterized super-constructor. Its field
+            // initializers are still usable when they do not read unavailable arguments/locals.
+            if (insn instanceof org.objectweb.asm.tree.VarInsnNode v && v.var != 0
+                    || insn instanceof org.objectweb.asm.tree.IincInsnNode) {
+                if (HorizonHooks.DEBUG) Natives.log("Mixin fields: " + init.mixin() + " needs constructor locals");
+                return null;
+            }
             if (insn instanceof LineNumberNode || insn instanceof FrameNode) continue;
             AbstractInsnNode c = insn.clone(labels);
             if (c instanceof FieldInsnNode f) {
                 if (f.owner.equals(mixin)) f.owner = target;
                 f.desc = f.desc.replace("L" + mixin + ";", "L" + target + ";");
-                // A final field is written only by its class's constructor: through reflection
-                // (put), its value boxed.
-                if (f.getOpcode() == Opcodes.PUTFIELD && f.owner.equals(target) && isFinal(owner, f.name)) {
+                // Reflection permits final fields and preserves values already initialized
+                // by other startup services when only part of this initializer is missing.
+                if (f.getOpcode() == Opcodes.PUTFIELD && f.owner.equals(target)) {
                     Type type = Type.getType(f.desc);
                     if (type.getSort() < Type.ARRAY) {
                         Type boxed = Type.getType(box(type));
@@ -220,8 +252,39 @@ public final class HorizonMixinInit {
             } else if (c instanceof LdcInsnNode l && l.cst instanceof Type t && t.getInternalName().equals(mixin)) {
                 l.cst = Type.getObjectType(target);
             } else if (c instanceof InvokeDynamicInsnNode d) {
-                // The mixin's own lambdas are merged under other names.
-                for (Object a : d.bsmArgs) if (a instanceof Handle h && h.getOwner().equals(mixin)) return null;
+                d.desc = d.desc.replace("L" + mixin + ";", "L" + target + ";");
+                for (int j = 0; j < d.bsmArgs.length; j++) {
+                    Object argument = d.bsmArgs[j];
+                    if (!(argument instanceof Handle h) || !h.getOwner().equals(mixin)) continue;
+                    String desc = h.getDesc().replace("L" + mixin + ";", "L" + target + ";");
+                    java.lang.reflect.Method found = null;
+                    for (var method : owner.getDeclaredMethods()) {
+                        var merged = method.getAnnotation(org.spongepowered.asm.mixin.transformer.meta.MixinMerged.class);
+                        if (merged == null || !merged.mixin().equals(mixin.replace('/', '.'))) continue;
+                        boolean named = HorizonHooks.handlerNamed(method.getName(), h.getName())
+                                || h.getName().startsWith("lambda$") && method.getName().matches(
+                                        ".*\\$" + java.util.regex.Pattern.quote(h.getName()) + "\\$[0-9]+");
+                        if (!named
+                                || !Type.getMethodDescriptor(method).equals(desc)) continue;
+                        if (found != null) return null;
+                        found = method;
+                    }
+                    // A method reference may name a shadow of an existing target method,
+                    // including one inherited from its superclass, rather than a merged lambda.
+                    if (found == null) for (Class<?> type = owner; type != null && found == null; type = type.getSuperclass()) {
+                        for (var method : type.getDeclaredMethods()) {
+                            if (method.getName().equals(h.getName()) && Type.getMethodDescriptor(method).equals(desc)) {
+                                found = method;
+                                break;
+                            }
+                        }
+                    }
+                    if (found == null) {
+                        if (HorizonHooks.DEBUG) Natives.log("Mixin fields: unresolved method reference " + init.mixin() + "." + h.getName() + desc);
+                        return null;
+                    }
+                    d.bsmArgs[j] = new Handle(h.getTag(), target, found.getName(), desc, h.isInterface());
+                }
             }
             code.add(c);
         }

@@ -72,7 +72,7 @@ fn move_due(
 #[derive(Default)]
 pub(super) struct JavaOverlay {
     /// The server draws one (its first frame came).
-    enabled: bool,
+    pub(super) enabled: bool,
     /// The server heard the inventory opened.
     open: bool,
     ops: Vec<Value>,
@@ -101,7 +101,14 @@ pub(super) struct JavaImages {
 #[derive(Default)]
 pub(super) struct JavaHud {
     ops: Vec<Value>,
+    hotbar: Option<JavaHotbar>,
     sent_size: Option<(i32, i32)>,
+}
+
+struct JavaHotbar {
+    size: (i32, i32),
+    selected: Option<usize>,
+    ops: Vec<Value>,
 }
 
 /// The mod screen a window shows, as its last frame drew it.
@@ -130,28 +137,26 @@ fn int(o: &Value, key: &str) -> f32 {
 
 /// The atlas key of a texture id: `minecraft:textures/gui/x.png` is `gui/x`, another
 /// namespace's `ns:gui/x` (HudAtlas packs mods' `textures/gui/` under their namespace).
-fn texture_key(id: &str) -> String {
+fn texture_key(id: &str) -> std::borrow::Cow<'_, str> {
     let (ns, path) = id.split_once(':').unwrap_or(("minecraft", id));
     let path = path
         .trim_start_matches("textures/")
         .trim_end_matches(".png");
     if ns == "minecraft" {
-        path.to_owned()
+        path.into()
     } else {
-        format!("{ns}:{path}")
+        format!("{ns}:{path}").into()
     }
 }
 
 /// A GUI sprite's key: `textures/gui/sprites/<path>` of its namespace.
 fn sprite_key(id: &str) -> String {
     let (ns, path) = id.split_once(':').unwrap_or(("minecraft", id));
-    texture_key(&format!("{ns}:gui/sprites/{path}"))
-}
-
-fn stack(o: &Value) -> Option<ItemStack> {
-    let snbt = o.get("item")?.as_str()?;
-    let (tag, _) = horizon_world::nbt::parse_snbt(snbt).ok()?;
-    horizon_items::item_nbt::item_from_nbt(&tag)
+    if ns == "minecraft" {
+        format!("gui/sprites/{path}")
+    } else {
+        format!("{ns}:gui/sprites/{path}")
+    }
 }
 
 /// Whether this game's own JVM runs every mod's client half (java_device): the server's HUD,
@@ -307,7 +312,7 @@ impl Game<'_> {
 
     /// A frame of the open window's mod screen ([`CHANNEL`]).
     pub(super) fn remote_java_screen(&mut self, data: &[u8]) {
-        let Ok(frame) = serde_json::from_slice::<Value>(data) else {
+        let Ok(mut frame) = serde_json::from_slice::<Value>(data) else {
             return;
         };
         let window = frame.get("window").and_then(Value::as_i64).unwrap_or(-1) as i32;
@@ -317,19 +322,23 @@ impl Game<'_> {
                 .java
                 .screen
                 .as_ref()
-                .is_some_and(|s| s.window == window)
+                .is_some_and(|s| s.window != window)
             {
-                self.java.screen = None;
+                return;
             }
+            self.java.screen = None;
             if self.screen == Screen::JavaMod {
                 self.leave_java_screen();
             }
             return;
         }
-        let ops = match frame.get("ops") {
-            Some(Value::Array(ops)) => self.take_java_images(ops),
-            _ => return,
-        };
+        if let Some(Value::Array(ops)) = frame.get_mut("ops").map(Value::take) {
+            self.apply_java_screen_frame(window, ops);
+        }
+    }
+
+    pub(super) fn apply_java_screen_frame(&mut self, window: i32, ops: Vec<Value>) {
+        let ops = self.take_java_images(ops);
         let typing = ops
             .iter()
             .any(|op| op.get("op").and_then(Value::as_str) == Some("typing"));
@@ -357,11 +366,50 @@ impl Game<'_> {
 
     /// A frame of the mods' HUD ([`HUD_CHANNEL`]).
     pub(super) fn remote_java_hud(&mut self, data: &[u8]) {
-        let Ok(Value::Array(ops)) = serde_json::from_slice::<Value>(data) else {
+        let Ok(Value::Array(mut ops)) = serde_json::from_slice::<Value>(data) else {
             return;
         };
-        let ops = self.take_java_images(&ops);
-        self.java.hud.get_or_insert_with(Default::default).ops = ops;
+        let hotbar = ops
+            .iter()
+            .position(|op| op["op"] == "hotbar_layer")
+            .and_then(|index| {
+                let mut layer = ops.remove(index);
+                let width = i32::try_from(layer["width"].as_i64()?).ok()?;
+                let height = i32::try_from(layer["height"].as_i64()?).ok()?;
+                let Value::Array(layer_ops) = layer["ops"].take() else {
+                    return None;
+                };
+                let layer_ops = self.take_java_images(layer_ops);
+                (!layer_ops.is_empty()).then_some(JavaHotbar {
+                    size: (width, height),
+                    selected: layer["selected"]
+                        .as_u64()
+                        .and_then(|slot| usize::try_from(slot).ok()),
+                    ops: layer_ops,
+                })
+            });
+        let ops = self.take_java_images(ops);
+        let hud = self.java.hud.get_or_insert_with(Default::default);
+        hud.ops = ops;
+        hud.hotbar = hotbar;
+    }
+
+    /// The native layer stays available until Java delivers a complete frame at this size.
+    pub(super) fn draw_java_hotbar(&mut self, batch: &mut HudBatch) -> bool {
+        let Some(hotbar) = self.java.hud.as_mut().and_then(|hud| hud.hotbar.take()) else {
+            return false;
+        };
+        // Scrolling changes Horizon's selected slot immediately. Don't paint
+        // an older Java frame's selection while waiting for its next tick.
+        let ready = hotbar.size == (batch.width as i32, batch.height as i32)
+            && hotbar.selected.is_none_or(|slot| slot == self.selected);
+        if ready {
+            self.draw_java_ops(batch, &hotbar.ops);
+        }
+        if let Some(hud) = self.java.hud.as_mut() {
+            hud.hotbar = Some(hotbar);
+        }
+        ready
     }
 
     /// A frame of the mods' overlay on the inventory ([`OVERLAY_CHANNEL`]).
@@ -369,7 +417,7 @@ impl Game<'_> {
         let Ok(Value::Array(ops)) = serde_json::from_slice::<Value>(data) else {
             return;
         };
-        let ops = self.take_java_images(&ops);
+        let ops = self.take_java_images(ops);
         let overlay = &mut self.java.overlay;
         overlay.enabled = true;
         overlay.typing = ops
@@ -409,7 +457,8 @@ impl Game<'_> {
         let open = !overlay.open;
         let send_size = !open && overlay.sent_size != Some(size);
         let now = std::time::Instant::now();
-        let send_mouse = move_due(overlay.sent_mouse, overlay.sent_mouse_at, mouse, now);
+        let send_mouse =
+            open || send_size || move_due(overlay.sent_mouse, overlay.sent_mouse_at, mouse, now);
         overlay.open = true;
         overlay.sent_size = Some(size);
         if send_mouse {
@@ -419,16 +468,14 @@ impl Game<'_> {
         if open {
             self.send_java_screen_input(
                 OVERLAY_WINDOW,
-                json!({"kind": "open", "width": size.0, "height": size.1}),
+                json!({"kind": "open", "width": size.0, "height": size.1, "x": mouse.0, "y": mouse.1}),
             );
-        }
-        if send_size {
+        } else if send_size {
             self.send_java_screen_input(
                 OVERLAY_WINDOW,
-                json!({"kind": "size", "width": size.0, "height": size.1}),
+                json!({"kind": "size", "width": size.0, "height": size.1, "x": mouse.0, "y": mouse.1}),
             );
-        }
-        if send_mouse {
+        } else if send_mouse {
             self.send_java_screen_input(
                 OVERLAY_WINDOW,
                 json!({"kind": "move", "x": mouse.0, "y": mouse.1}),
@@ -503,8 +550,7 @@ impl Game<'_> {
         #[cfg(feature = "java-mods")]
         {
             super::java_device::gui_size(batch.width as i32, batch.height as i32);
-            let ops = super::java_device::hud_ops();
-            if !ops.is_empty() {
+            if let Some(ops) = super::java_device::hud_ops() {
                 self.draw_java_ops(batch, &ops);
             }
         }
@@ -600,10 +646,13 @@ impl Game<'_> {
         let ops = self
             .java
             .screen
-            .as_ref()
-            .map(|s| s.ops.clone())
+            .as_mut()
+            .map(|s| std::mem::take(&mut s.ops))
             .unwrap_or_default();
         let (tooltip, lines_tooltip) = self.draw_java_ops(batch, &ops);
+        if let Some(screen) = self.java.screen.as_mut() {
+            screen.ops = ops;
+        }
         if let Some(stack) = tooltip {
             let (x, y) = self.cursor;
             self.draw_stack_tooltip(batch, &stack, x, y);
@@ -701,12 +750,13 @@ impl Game<'_> {
                     // (a mod's "single" source: textures/gui/x.png); else gui/sprites/.
                     let key = match o.get("texture").and_then(Value::as_str) {
                         Some(texture) => texture_key(texture),
-                        None if kind == "blit" => String::new(),
+                        None if kind == "blit" => continue,
                         None => {
                             sprite_key(o.get("sprite").and_then(Value::as_str).unwrap_or_default())
+                                .into()
                         }
                     };
-                    let Some(sprite) = atlas.sprites.get(&key).copied() else {
+                    let Some(sprite) = atlas.sprites.get(key.as_ref()).copied() else {
                         continue;
                     };
                     let (u, v) = (sprite.u1 - sprite.u0, sprite.v1 - sprite.v0);
@@ -771,12 +821,12 @@ impl Game<'_> {
                     }
                 }
                 "item" => {
-                    if let Some(stack) = stack(o) {
+                    if let Some(stack) = self.java_ui_stack(o) {
                         self.draw_item_model(batch, &stack, int(o, "x") + dx, int(o, "y") + dy);
                     }
                 }
                 "decorations" => {
-                    if let Some(stack) = stack(o) {
+                    if let Some(stack) = self.java_ui_stack(o) {
                         let count = o.get("count").and_then(Value::as_str).map(str::to_owned);
                         self.draw_item_decorations(
                             batch,
@@ -821,7 +871,7 @@ impl Game<'_> {
                     scissors.pop();
                     continue;
                 }
-                "item_tooltip" => tooltip = stack(o),
+                "item_tooltip" => tooltip = self.java_ui_stack(o),
                 "tooltip" => {
                     let lines: Vec<horizon_client::text::Text> = o
                         .get("lines")
@@ -851,18 +901,37 @@ impl Game<'_> {
         (tooltip, lines_tooltip)
     }
 
+    fn java_ui_stack(&self, op: &Value) -> Option<ItemStack> {
+        let snbt = op.get("item")?.as_str()?;
+        let mut items = self.java.ui_items.borrow_mut();
+        if let Some(stack) = items.get(snbt) {
+            return stack.clone();
+        }
+        let stack = horizon_world::nbt::parse_snbt(snbt)
+            .ok()
+            .and_then(|(tag, _)| horizon_items::item_nbt::item_from_nbt(&tag));
+        // Bound retained SNBT as well as the number of entries.
+        if snbt.len() <= 4096 {
+            if items.len() >= 128 {
+                items.clear();
+            }
+            items.insert(snbt.to_owned(), stack.clone());
+        }
+        stack
+    }
+
     /// A frame's operations with its images stored as they arrive (a frame may be replaced
     /// by the next before it is drawn; its images are sent once).
-    pub(super) fn take_java_images(&mut self, ops: &[Value]) -> Vec<Value> {
-        let mut kept = Vec::with_capacity(ops.len());
-        for o in ops {
+    pub(super) fn take_java_images(&mut self, mut ops: Vec<Value>) -> Vec<Value> {
+        ops.retain(|o| {
             if o.get("op").and_then(Value::as_str) == Some("image") {
                 self.store_java_image(o);
+                false
             } else {
-                kept.push(o.clone());
+                true
             }
-        }
-        kept
+        });
+        ops
     }
 
     /// The Java image slot holding the image named `name`, with the image's size.
@@ -880,25 +949,51 @@ impl Game<'_> {
     /// into an atlas slot (its own again, else a free one, else the least recently stored),
     /// shrunk to fit.
     pub(super) fn store_java_image(&mut self, o: &Value) {
-        let (Some(name), Some(rgba)) = (
+        let (Some(name), Some(encoded)) = (
             o.get("name").and_then(Value::as_str),
-            o.get("rgba")
-                .and_then(Value::as_str)
-                .and_then(horizon_client::skins::base64_decode),
+            o.get("rgba").and_then(Value::as_str),
         ) else {
             return;
         };
-        let (w, h) = (int(o, "width") as u32, int(o, "height") as u32);
-        if w == 0 || h == 0 || rgba.len() < (w * h * 4) as usize {
+        let dimension = |key| o.get(key)?.as_u64().and_then(|n| u32::try_from(n).ok());
+        let (Some(w), Some(h)) = (dimension("width"), dimension("height")) else {
+            return;
+        };
+        let Some(bytes) = (w as usize)
+            .checked_mul(h as usize)
+            .and_then(|n| n.checked_mul(4))
+        else {
+            return;
+        };
+        if bytes == 0 || bytes > 16 * 1024 * 1024 || encoded.len() > bytes.div_ceil(3) * 4 {
+            return;
+        }
+        let Some(rgba) =
+            horizon_client::skins::base64_decode(encoded).filter(|rgba| rgba.len() == bytes)
+        else {
+            return;
+        };
+        self.store_java_pixels(name, w, h, rgba);
+    }
+
+    pub(super) fn store_java_pixels(&mut self, name: &str, w: u32, h: u32, rgba: Vec<u8>) {
+        let bytes = (w as usize)
+            .checked_mul(h as usize)
+            .and_then(|n| n.checked_mul(4));
+        if rgba.is_empty() || rgba.len() > 16 * 1024 * 1024 || bytes != Some(rgba.len()) {
             return;
         }
         use horizon_client::hud::{
-            JAVA_BIG_IMAGE_SLOTS, JAVA_IMAGE_SIZE, JAVA_IMAGE_SLOTS, java_image_slot,
+            JAVA_BIG_IMAGE_SIZE, JAVA_BIG_IMAGE_SLOTS, JAVA_IMAGE_SIZE, JAVA_IMAGE_SLOTS,
+            JAVA_SCREEN_IMAGE_SLOTS, java_image_slot,
         };
         // Images bigger than a small slot take a big one (small and big slots are evicted
         // apart, least recently stored first).
         let big = w > JAVA_IMAGE_SIZE || h > JAVA_IMAGE_SIZE;
-        let range = if big {
+        let range = if w > JAVA_BIG_IMAGE_SIZE || h > JAVA_BIG_IMAGE_SIZE {
+            JAVA_IMAGE_SLOTS + JAVA_BIG_IMAGE_SLOTS
+                ..JAVA_IMAGE_SLOTS + JAVA_BIG_IMAGE_SLOTS + JAVA_SCREEN_IMAGE_SLOTS
+        } else if big {
             JAVA_IMAGE_SLOTS..JAVA_IMAGE_SLOTS + JAVA_BIG_IMAGE_SLOTS
         } else {
             0..JAVA_IMAGE_SLOTS
@@ -930,21 +1025,27 @@ impl Game<'_> {
         };
         // Nearest-neighbour into the slot's square (the part the image fills).
         let (sw, sh) = (w.min(side), h.min(side));
-        let mut out = vec![0u8; (side * side * 4) as usize];
-        for y in 0..sh {
-            for x in 0..sw {
-                let (sx, sy) = (x * w / sw, y * h / sh);
-                let from = ((sy * w + sx) * 4) as usize;
-                let to = ((y * side + x) * 4) as usize;
-                out[to..to + 4].copy_from_slice(&rgba[from..from + 4]);
+        let out = if sw == w && sh == h {
+            rgba
+        } else {
+            let mut out = vec![0u8; (sw * sh * 4) as usize];
+            for y in 0..sh {
+                for x in 0..sw {
+                    let sx = (u64::from(x) * u64::from(w) / u64::from(sw)) as u32;
+                    let sy = (u64::from(y) * u64::from(h) / u64::from(sh)) as u32;
+                    let from = ((sy * w + sx) * 4) as usize;
+                    let to = ((y * sw + x) * 4) as usize;
+                    out[to..to + 4].copy_from_slice(&rgba[from..from + 4]);
+                }
             }
-        }
+            out
+        };
         let (aw, ah) = (self.gui.atlas.width as f32, self.gui.atlas.height as f32);
         self.map_patches.push(horizon_client::font::Patch {
             x: (rect.u0 * aw).round() as u32,
             y: (rect.v0 * ah).round() as u32,
-            width: side,
-            height: side,
+            width: sw,
+            height: sh,
             rgba: out,
         });
     }
@@ -1175,7 +1276,7 @@ pub(super) fn key_text(key: KeyCode) -> Option<String> {
 
 /// SDL3's key code for a key (`KeyEvent.shortcutKey`, what text boxes' editing keys and
 /// shortcuts match): a character key's character, others their scancode with bit 30 set.
-fn sdl_keycode(key: KeyCode, scancode: i32) -> i32 {
+pub(super) fn sdl_keycode(key: KeyCode, scancode: i32) -> i32 {
     use KeyCode as K;
     if let Some(text) = key_text(key) {
         return text.chars().next().map_or(scancode, |c| c as i32);
@@ -1207,7 +1308,7 @@ const CONTROL: i32 = 192;
 
 /// winit's key → 26.3's key code (`InputConstants.KEY_*`: SDL3 scancodes, the USB HID usage
 /// numbers), what Java screens compare against.
-fn sdl_key(key: KeyCode) -> Option<i32> {
+pub(super) fn sdl_key(key: KeyCode) -> Option<i32> {
     use KeyCode as K;
     let letters = [
         K::KeyA,

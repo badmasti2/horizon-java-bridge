@@ -369,6 +369,17 @@ pub fn last() -> Vec<Widget> {
     })
 }
 
+/// Rectangles already drawn in the current screen, before adding a mod layer.
+pub fn current_button_bounds() -> Vec<[f32; 4]> {
+    WIDGETS.with_borrow(|(current, _, _)| {
+        current
+            .iter()
+            .filter(|w| w.kind == Kind::Button)
+            .map(|w| [w.x, w.y, w.w, w.h])
+            .collect()
+    })
+}
+
 /// Every labelled widget of the last drawn frame, sliders and tabs included.
 pub fn last_labelled() -> Vec<Widget> {
     WIDGETS.with_borrow(|(_, last, _)| last.clone())

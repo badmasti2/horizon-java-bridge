@@ -446,6 +446,13 @@ fn start_once(root: &Path, dir: &Path, jars: Vec<PathBuf>, side: horizon_jvm::Si
         }
     };
     let archive = class_archive(&jars);
+    if side == horizon_jvm::Side::Client {
+        if let Some(session) = horizon_client::auth::current() {
+            horizon_jvm::set_client_session(&session.name,
+                &horizon_protocol::crypto::uuid_string(session.uuid), session.access_token(),
+                session.xuid.as_deref().unwrap_or(""));
+        }
+    }
     let config = |home| horizon_jvm::Config {
         home,
         work: work.clone(),

@@ -1226,6 +1226,16 @@ impl Game<'_> {
         }
         #[cfg(feature = "java-mods")]
         super::java_device::left();
+        // These frames belong to the old connection. A vanilla multiplayer
+        // server won't send replacements for the integrated world's Java HUD.
+        self.java.hud = None;
+        #[cfg(feature = "java-mods")]
+        {
+            self.java.next_hud_frame = None;
+        }
+        self.java.screen = None;
+        self.java.overlay = Default::default();
+        self.java.binds = Default::default();
         if self.remote.is_some() {
             self.native_client_disconnecting();
         }
@@ -1668,6 +1678,21 @@ impl Game<'_> {
         let error = matches!(trust, ChatTrust::Error);
         if !error && !self.chat_received(false, false, sender, Some(chat_type), &mut line) {
             return false;
+        }
+        if !error && self.settings.extras.chat_heads && sender != 0 {
+            let name = self.remote.as_ref().and_then(|r| r.players.get(&sender));
+            let mut head = horizon_client::text::Text::literal("\u{fffc}");
+            head.spans[0].style.inline_object = Some(horizon_client::text::InlineObject::Player {
+                profile: serde_json::json!({
+                    "id": horizon_protocol::crypto::uuid_string(sender),
+                    "name": name,
+                }),
+                hat: true,
+                fallback: String::new(),
+            });
+            line = head
+                .append(horizon_client::text::Text::literal(" "))
+                .append(line);
         }
         let source = horizon_client::chat::ChatSource::Player;
         let shown = self.signed_chat_line(line, source, signature, trust);
@@ -4880,6 +4905,27 @@ impl Game<'_> {
             }
             C::DisguisedChat(p) => {
                 let content = horizon_client::scoreboard::tag_to_json(&p.message);
+                // The integrated host delivers ordinary unsigned player chat with the
+                // sender's profile name. Outside that host, disguised chat has no identity.
+                let sender = self
+                    .remote
+                    .as_ref()
+                    .filter(|r| {
+                        self.integrated.is_some()
+                            && self.settings.extras.chat_heads
+                            && r.registries
+                                .name("minecraft:chat_type", p.chat_type.chat_type)
+                                == Some("minecraft:chat")
+                    })
+                    .and_then(|r| {
+                        let name = horizon_client::scoreboard::tag_to_json(&p.chat_type.name);
+                        let name = name.as_str().or_else(|| name.get("text")?.as_str())?;
+                        r.players
+                            .iter()
+                            .find(|(_, listed)| listed.as_str() == name)
+                            .map(|(id, _)| *id)
+                    })
+                    .unwrap_or(0);
                 let narration = self
                     .decorate_chat(&p.chat_type, &content, Decoration::Narration)
                     .plain();
@@ -4889,7 +4935,7 @@ impl Game<'_> {
                     signature: None,
                     trust: ChatTrust::Secure,
                     narration,
-                    sender: 0,
+                    sender,
                     chat_type: p.chat_type.chat_type,
                 });
             }
@@ -5267,16 +5313,28 @@ impl Game<'_> {
     pub(super) fn resolve_inline_profiles(&mut self, profiles: &[serde_json::Value]) {
         use horizon_client::skins;
         for profile in profiles {
+            let info = skins::parse_profile(profile);
+            let id = info.id;
+            let name = profile
+                .as_str()
+                .or_else(|| profile.get("name").and_then(serde_json::Value::as_str));
+            if info.textures.is_none()
+                && let Some(r) = &self.remote
+                && r.players.get(&id).map(String::as_str) == name
+                && let Some(skin) = r.skins.get(&id).cloned()
+                && self.again_skin(&skin)
+            {
+                self.gui
+                    .atlas
+                    .set_object_skin(format!("id:{id:032x}"), skin);
+                continue;
+            }
             let skin = skins::head_skin(
                 profile,
                 &mut self.skin_profiles.borrow_mut(),
                 &mut self.skin_downloads.borrow_mut(),
                 |location| self.gui.atlas.sprites.contains_key(location),
             );
-            let id = skins::parse_profile(profile).id;
-            let name = profile
-                .as_str()
-                .or_else(|| profile.get("name").and_then(serde_json::Value::as_str));
             // The player list's skin for the same profile is drawn too.
             let keys = [
                 Some(format!("id:{id:032x}")),

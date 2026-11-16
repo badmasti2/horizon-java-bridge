@@ -147,6 +147,7 @@ public final class HorizonDeviceMods {
      * (or when no player's client runs).
      */
     public static boolean runs(String mod) {
+        if (HorizonDeviceClient.own()) return true;
         if (OWN_CLIENT) {
             // A server's headless client runs none of the client of a player whose own game runs
             // it; everything else runs as before (this game's own player, players whose game
@@ -197,7 +198,9 @@ public final class HorizonDeviceMods {
     static boolean deviceChannel(net.minecraft.resources.Identifier channel) {
         // Every mod's client half in its player's game: every channel but vanilla's and Horizon's
         // (Fabric API's own, its client half's too).
-        if (OWN_CLIENT) return !channel.getNamespace().equals("minecraft") && !channel.getNamespace().equals("horizon");
+        if (OWN_CLIENT || HorizonDeviceClient.own()) {
+            return !channel.getNamespace().equals("minecraft") && !channel.getNamespace().equals("horizon");
+        }
         return device(channel.getNamespace());
     }
 }
