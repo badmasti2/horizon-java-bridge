@@ -46,6 +46,12 @@ In isolated playtests, Essential 1.5.2 started, rendered its menu and settings, 
 - I have not verified full modpacks or every Fabric mod in game. The focused hook tests establish callback behavior, not universal mod compatibility.
 - The downloadable Windows executable was built shortly before the last local source fixes. The playable ZIP and the latest source commit are **not an exact build pair**.
 
+## A note on using this fork
+
+I made this as a fun project. It gives people another way to try mods in Horizon, which I think is better than having no bridge at all, but it is not perfect and there are still plenty of bugs. If the mod you want has not been ported to Horizon, I recommend using normal Minecraft Java Edition for regular play. This bridge is not a viable substitute for it, especially with complicated UI-heavy mods.
+
+Some simpler things do work: I added a native Chat Heads-style feature, and Simple Voice Chat has worked in bridge tests, along with other mods. I put particular effort into making Essential feel as close to the normal Java experience as I could. Its menus and settings reached my isolated playtests, while its online and social features still need work.
+
 ## Download and run my Windows build
 
 Download and extract the entire [Windows ZIP](https://github.com/badmasti2/horizon-java-bridge/releases/download/shady-playtest-2026-11-08/Horizon-Fabric-Bridge-Shady-Windows-x64.zip). You need a Microsoft account that owns Minecraft: Java Edition, Minecraft Java 26.3 launched once in the official launcher, and Java 25 for Fabric mods. The patched launcher can provision Java after sign-in.
