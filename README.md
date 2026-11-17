@@ -52,7 +52,7 @@ I made this as a fun project. It gives people another way to try mods in Horizon
 
 Some simpler things do work: I added a native Chat Heads-style feature, and Simple Voice Chat has worked in bridge tests, along with other mods. I put particular effort into making Essential feel as close to the normal Java experience as I could. Its menus and settings reached my isolated playtests, while its online and social features still need work.
 
-What i tested that works perfectly pretty much
+$$ What i tested that works perfectly pretty much
 
 Essentials mod: Everything works exept for world sharing and cosmetics but who used those anyways
 
@@ -72,7 +72,7 @@ Mouse tweaks: Works sorta i cant tell ikl
 
 Continuity: it works on glass but im not sure about other things
 
-What doesnt work 
+## What doesnt work 
 
 Things that optimize the game
 
