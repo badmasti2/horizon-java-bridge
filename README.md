@@ -21,6 +21,12 @@
 
 Horizon plays Minecraft in Rust. The bridge lets it play the **mods people already use**: the same Fabric 26.3 jars you'd put in a normal mods folder, unchanged. Horizon keeps running the game (world, mobs, redstone, physics, saving, multiplayer, all rendering); a Java VM inside Horizon runs only the mods' own code, where a mod changes something. Turned off, it's plain Horizon with no Java at all.
 
+## Shady's fork
+
+This fork includes Shady's local compatibility and UI fixes on the [`my-version` branch](https://github.com/badmasti2/horizon-java-bridge/tree/my-version). Download the [Windows playtest build](https://github.com/badmasti2/horizon-java-bridge/releases) or [this fork's source ZIP](https://github.com/badmasti2/horizon-java-bridge/archive/refs/heads/my-version.zip). The Windows package targets Horizon `nightly-2026-11-04-3fb4c31` and Minecraft Java 26.3; follow its included `README.txt` to install it.
+
+The upstream instructions below describe the main bridge release. This fork's Windows package is a separate playtest build.
+
 ## Get it
 
 You need a Microsoft account that owns Minecraft: Java Edition, and Minecraft 26.3 played once in the official launcher. Playing with mods works only through the launcher, after sign-in: there's no offline way, and nothing for the mods is downloaded before you sign in.
@@ -36,7 +42,7 @@ Found a bug? Post it with a screenshot or video, your mod list and `logs/latest.
 <summary>Build from source instead</summary>
 
 ```sh
-git clone -b java-bridge https://github.com/iaxivers/horizon-java-bridge && cd horizon-java-bridge
+git clone -b my-version https://github.com/badmasti2/horizon-java-bridge && cd horizon-java-bridge
 cargo build --profile fast -p horizon-client --features horizon-client/java-mods
 cd launcher && cargo build --release    # Fedora needs libxkbcommon-x11-devel
 horizon-launcher java-mods use-build ../target/fast/horizon-client
