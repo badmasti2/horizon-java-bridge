@@ -52,6 +52,47 @@ I made this as a fun project. It gives people another way to try mods in Horizon
 
 Some simpler things do work: I added a native Chat Heads-style feature, and Simple Voice Chat has worked in bridge tests, along with other mods. I put particular effort into making Essential feel as close to the normal Java experience as I could. Its menus and settings reached my isolated playtests, while its online and social features still need work.
 
+What i tested that works perfectly pretty much
+
+Essentials mod: Everything works exept for world sharing and cosmetics but who used those anyways
+
+Mod menu: it works everything works 1 bug that if you scroll down then up the photos on the mods dissaper
+
+Apple Skin: works perfecly
+
+## What semi works
+
+Simple voice chat: The ui works not sure if it actully works
+
+Xeros minimap: works but its buggy low fps and you can open the full map but its laggy and gives errors in chat I did try to optimize it so its not unusable but not super good
+
+Uku,s armor Hud: It works but it flashes off and on when you change hotbar slot
+
+Mouse tweaks: Works sorta i cant tell ikl
+
+Continuity: it works on glass but im not sure about other things
+
+What doesnt work 
+
+Things that optimize the game
+
+Sodium
+
+Anything that changes sounds like:
+
+presence footsteps and
+Sound phsyics reimagened
+
+Shulkerbox tooltip
+
+remove loading screen
+
+Visuality
+
+and any zoom mods
+
+I wont be working on this any farther but feel free to edit this yourself But if your going to edit it with ai be mindfull it Burns through tokens
+
 ## Download and run my Windows build
 
 Download and extract the entire [Windows ZIP](https://github.com/badmasti2/horizon-java-bridge/releases/download/shady-playtest-2026-11-08/Horizon-Fabric-Bridge-Shady-Windows-x64.zip). You need a Microsoft account that owns Minecraft: Java Edition, Minecraft Java 26.3 launched once in the official launcher, and Java 25 for Fabric mods. The patched launcher can provision Java after sign-in.
