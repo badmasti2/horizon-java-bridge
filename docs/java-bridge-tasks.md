@@ -2167,7 +2167,7 @@ client model reload. The final executable renders its menu and settings, convert
 scales, returns to the menu and preserves native singleplayer navigation without bridge or
 GPU validation failures. Both GPU regression tests pass. The Java mirror uses an offline
 profile: Essential's online/social features remain unfinished. Full modpacks are unverified.
-No external source copied. Local changes only; no push, issue or PR posted.
+No external source copied. At the time of this local test, no push, issue or PR had been posted. The changes were later published on the `my-version` branch of [badmasti2/horizon-java-bridge](https://github.com/badmasti2/horizon-java-bridge).
 
 ### UI and world-entry fixes (2026-11-07; Codex)
 
